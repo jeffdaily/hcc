@@ -75,7 +75,7 @@
 #define MAX_INFLIGHT_COMMANDS_PER_QUEUE  (2*8192)
 
 // threshold to clean up finished kernel in HSAQueue.asyncOps
-#define ASYNCOPS_VECTOR_GC_SIZE (2*8192)
+long int HCC_ASYNCOPS_VECTOR_GC_SIZE = MAX_INFLIGHT_COMMANDS_PER_QUEUE;
 
 
 //---
@@ -2198,10 +2198,17 @@ public:
 
 
         // GC for finished kernels
-        if (asyncOps.size() > ASYNCOPS_VECTOR_GC_SIZE) {
+        if (asyncOps.size() > HCC_ASYNCOPS_VECTOR_GC_SIZE) {
             DBOUTL(DB_RESOURCE, "asyncOps size=" << asyncOps.size() << " exceeds collection size, compacting");
-            asyncOps.erase(std::remove(asyncOps.begin(), asyncOps.end(), nullptr),
-                         asyncOps.end());
+            size_t new_i = 0;
+            for (size_t i=0; i<asyncOps.size(); ++i) {
+                if (nullptr != asyncOps[i]) {
+                    asyncOps[new_i] = asyncOps[i];
+                    asyncOps[new_i]->asyncOpsIndex(new_i);
+                    ++new_i;
+                }
+            }
+            asyncOps.resize(new_i);
         }
     }
 };
@@ -3744,6 +3751,7 @@ void HSAContext::ReadHccEnv()
 
     GET_ENV_INT(HCC_CHECK_COPY, "Check dst == src after each copy operation.  Only works on large-bar systems.");
 
+    GET_ENV_INT(HCC_ASYNCOPS_VECTOR_GC_SIZE, "Number of finished kernels prior to running garbage collection.");
 
     // Select thresholds to use for unpinned copies
     GET_ENV_INT (HCC_H2D_STAGING_THRESHOLD,    "Min size (in KB) to use staging buffer algorithm for H2D copy if ChooseBest algorithm selected");
