@@ -705,15 +705,130 @@ struct HSAOpCoord
     uint64_t    _queueId;
 };
 
+template <class T>
+class CircularBuffer {
+    public:
+        typedef typename std::vector<T>::size_type size_type;
+        typedef T* pointer;
+        typedef const T* const_pointer;
+        typedef T& reference;
+        typedef const T& const_reference;
+
+        template <class Pointer>
+        void increment(Pointer& p) const {
+            if (++p == m_end)
+                p = m_buff;
+        }
+
+        template <class Pointer>
+        void decrement(Pointer& p) const {
+            if (p == m_buff)
+                p = m_end;
+            --p;
+        }
+
+        explicit CircularBuffer(size_type capacity) {
+            m_size = 0;
+            m_vec.resize(capacity);
+            m_buff = m_first = m_last = &m_vec[0];
+            m_end = &m_vec[capacity];
+        }
+
+        size_type size() const { return m_size; }
+        size_type capacity() const { return m_end - m_buff; }
+        bool empty() const { return size() == 0; }
+        bool full() const { return capacity() == size(); }
+
+        template <class Value>
+        void push_back(Value item) {
+            assert(!full());
+            *m_last = item;
+            increment(m_last);
+            ++m_size;
+        }
+
+        void clear() {
+            m_size = 0;
+            m_buff = m_first = m_last = &m_vec[0];
+        }
+
+        reference back() { return *((m_last == m_buff ? m_end : m_last) - 1); }
+        pointer last() { return m_last == m_end ? m_buff : m_last; }
+        pointer first() { return m_first; }
+
+        reference operator[] (size_type n) {
+            assert(n < size());
+            if (m_first < m_last) {
+                return *(m_first+n);
+            }
+            else {
+                return *(m_buff + (n - (m_end-m_first)));
+            }
+        }
+
+        /* check p whether it is between m_first and m_last */
+        bool is_valid(const_pointer p) {
+            /* empty buffer makes everything invalid */
+            if (empty()) return false;
+            /* outside possible memory range of buffer, invalid */
+            if (p < m_buff || p >= m_end) return false;
+            /* case where virtual beginning and end are in order */
+            if (m_first < m_last) return m_first <= p && p < m_last;
+            /* case where virtual beginning and end are swapped */
+            else return !(m_last <= p && p < m_first);
+        }
+
+        /* move virtual beginning one past the given pointer */
+        /* assumes p is valid */
+        void gc(pointer p) {
+            size_type distance;
+            if (p >= m_first) {
+                distance = p - m_first + 1;
+            }
+            else {
+                distance = (m_end - m_first) + (p - m_buff);
+            }
+            m_size -= distance;
+            m_first = p;
+            increment(p);
+        }
+
+        template <class UnaryPredicate>
+        const_pointer crfind_if(UnaryPredicate q) {
+            if (empty()) return nullptr;
+            auto first = m_last;
+            auto last = m_first;
+            decrement(first);
+            decrement(last);
+            for (; first != last; decrement(first)) {
+                if (q(*first)) {
+                    return first;
+                }
+            }
+            return nullptr;
+        }
+
+    private:
+        std::vector<T> m_vec;
+        size_type m_size; // number of items currenlt stored
+        pointer m_buff; // internal buffer's beginning (beginning of storage space)
+        pointer m_end; // internal buffer's end (end of storage space)
+        pointer m_first; // virtual beginning of circular buffer
+        pointer m_last; // virtual end of circular buffer (one behind last element)
+};
+
+class HSAOp;
+typedef std::shared_ptr<HSAOp>* OpIndex;
+
 // Base class for the other HSA ops:
 class HSAOp : public Kalmar::KalmarAsyncOp {
 public:
     HSAOp(Kalmar::KalmarQueue *queue, hc::hcCommandKind commandKind) ;
 
     const HSAOpCoord opCoord() const { return _opCoord; };
-    int asyncOpsIndex() const { return _asyncOpsIndex; };
+    OpIndex asyncOpsIndex() const { return _asyncOpsIndex; };
 
-    void asyncOpsIndex(int asyncOpsIndex) { _asyncOpsIndex = asyncOpsIndex; };
+    void asyncOpsIndex(OpIndex asyncOpsIndex) { _asyncOpsIndex = asyncOpsIndex; };
 
     void* getNativeHandle() override { return &_signal; }
 
@@ -725,7 +840,7 @@ public:
 protected:
     uint64_t     apiStartTick;
     HSAOpCoord   _opCoord;
-    int          _asyncOpsIndex;
+    OpIndex      _asyncOpsIndex;
 
     hsa_signal_t _signal;
     int          _signalIndex;
@@ -1285,7 +1400,7 @@ private:
     // HSAQueue::wait(), and all future objects in the KalmarAsyncOp objects
     // will be waited on.
     //
-    std::vector< std::shared_ptr<HSAOp> > asyncOps;
+    CircularBuffer< std::shared_ptr<HSAOp> > asyncOps;
 
     uint64_t                                      queueSeqNum; // sequence-number of this queue.
 
@@ -1441,7 +1556,7 @@ public:
 
             wait();
         }
-        op->asyncOpsIndex(asyncOps.size());
+        op->asyncOpsIndex(asyncOps.last());
         youngestCommandKind = op->getCommandKind();
         asyncOps.push_back(std::move(op));
 
@@ -1553,11 +1668,11 @@ public:
         
         bool isEmpty = true;
 
-        const auto& oldest = find_if(
-                    asyncOps.crbegin(), asyncOps.crend(), [](const std::shared_ptr<HSAOp> &asyncOp) { return asyncOp != nullptr; });
+        const auto& oldest = asyncOps.crfind_if(
+                [](const std::shared_ptr<HSAOp> &asyncOp) { return asyncOp != nullptr; });
 
 
-        if (oldest != asyncOps.crend()) {
+        if (oldest != nullptr) {
             hsa_signal_t signal = *(static_cast <hsa_signal_t*> ((*oldest)->getNativeHandle()));
             if (signal.handle) {
                 hsa_signal_value_t v = hsa_signal_load_scacquire(signal);
@@ -2159,20 +2274,19 @@ public:
 
     // remove finished async operation from waiting list
     void removeAsyncOp(HSAOp* asyncOp) {
-        int targetIndex = asyncOp->asyncOpsIndex();
+        OpIndex targetIndex = asyncOp->asyncOpsIndex();
 
         // Make sure the opindex is still valid.
         // If the queue is destroyed first it may not exist in asyncops anymore so no need to destroy.
-        if (targetIndex < asyncOps.size() &&
-            asyncOp == asyncOps[targetIndex].get()) {
+        if (asyncOps.is_valid(targetIndex) && asyncOp == targetIndex->get()) {
 
             // All older ops are known to be done and we can reclaim their resources here:
             // Both execute_in_order and execute_any_order flags always remove ops in-order at the end of the pipe.
             // Note if not found above targetIndex=-1 and we skip the loop:
-            for (int i = targetIndex; i>=0; i--) {
-                Kalmar::KalmarAsyncOp *op = asyncOps[i].get();
+            for (OpIndex iter = targetIndex; iter >= asyncOps.first(); asyncOps.decrement(iter)) {
+                Kalmar::KalmarAsyncOp *op = iter->get();
                 if (op) {
-                    asyncOps[i].reset();
+                    iter->reset();
 
         #if CHECK_OLDER_COMPLETE
                     // opportunistically update status for any ops we encounter along the way:
@@ -2200,8 +2314,7 @@ public:
         // GC for finished kernels
         if (asyncOps.size() > ASYNCOPS_VECTOR_GC_SIZE) {
             DBOUTL(DB_RESOURCE, "asyncOps size=" << asyncOps.size() << " exceeds collection size, compacting");
-            asyncOps.erase(std::remove(asyncOps.begin(), asyncOps.end(), nullptr),
-                         asyncOps.end());
+            asyncOps.gc(targetIndex);
         }
     }
 };
@@ -3991,7 +4104,7 @@ std::ostream& operator<<(std::ostream& os, const HSAQueue & hav)
 HSAQueue::HSAQueue(KalmarDevice* pDev, hsa_agent_t agent, execute_order order, queue_priority priority) :
     KalmarQueue(pDev, queuing_mode_automatic, order, priority),
     rocrQueue(nullptr),
-    asyncOps(), drainingQueue_(false),
+    asyncOps(2*MAX_INFLIGHT_COMMANDS_PER_QUEUE), drainingQueue_(false),
     valid(true), _nextSyncNeedsSysRelease(false), _nextKernelNeedsSysAcquire(false), bufferKernelMap(), kernelBufferMap()
 {
     {
@@ -5065,7 +5178,7 @@ HSAOpCoord::HSAOpCoord(Kalmar::HSAQueue *queue) :
 HSAOp::HSAOp(Kalmar::KalmarQueue *queue, hc::hcCommandKind commandKind) :
     KalmarAsyncOp(queue, commandKind),
     _opCoord(static_cast<Kalmar::HSAQueue*> (queue)),
-    _asyncOpsIndex(-1),
+    _asyncOpsIndex(nullptr),
 
     _signalIndex(-1),
     _agent(static_cast<Kalmar::HSADevice*>(hsaQueue()->getDev())->getAgent())
