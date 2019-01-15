@@ -75,7 +75,7 @@
 #define MAX_INFLIGHT_COMMANDS_PER_QUEUE  (2*8192)
 
 // threshold to clean up finished kernel in HSAQueue.asyncOps
-#define ASYNCOPS_VECTOR_GC_SIZE (2*8192)
+int HCC_ASYNCOPS_GC_SIZE = MAX_INFLIGHT_COMMANDS_PER_QUEUE;
 
 
 //---
@@ -2312,7 +2312,7 @@ public:
 
 
         // GC for finished kernels
-        if (asyncOps.size() > ASYNCOPS_VECTOR_GC_SIZE) {
+        if (asyncOps.size() > HCC_ASYNCOPS_GC_SIZE) {
             DBOUTL(DB_RESOURCE, "asyncOps size=" << asyncOps.size() << " exceeds collection size, compacting");
             asyncOps.gc(targetIndex);
         }
@@ -3852,6 +3852,8 @@ void HSAContext::ReadHccEnv()
     GET_ENV_INT(HCC_MAX_QUEUES, "Set max number of HSA queues this process will use.  accelerator_views will share the allotted queues and steal from each other as necessary");
 
     GET_ENV_INT(HCC_SIGNAL_POOL_SIZE, "Number of pre-allocated HSA signals.  Signals are precious resource so manage carefully");
+
+    GET_ENV_INT(HCC_ASYNCOPS_GC_SIZE, "Number of inflight async ops prior to garbace collection.");
 
     GET_ENV_INT(HCC_UNPINNED_COPY_MODE, "Select algorithm for unpinned copies. 0=ChooseBest(see thresholds), 1=PinInPlace, 2=StagingBuffer, 3=Memcpy");
 
