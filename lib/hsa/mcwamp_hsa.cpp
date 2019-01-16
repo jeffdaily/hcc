@@ -728,6 +728,7 @@ class CircularBuffer {
         }
 
         explicit CircularBuffer(size_type capacity) {
+            m_capacity = capacity;
             m_size = 0;
             m_vec.resize(capacity);
             m_buff = m_first = m_last = &m_vec[0];
@@ -735,7 +736,7 @@ class CircularBuffer {
         }
 
         size_type size() const { return m_size; }
-        size_type capacity() const { return m_end - m_buff; }
+        size_type capacity() const { return m_capacity; }
         bool empty() const { return size() == 0; }
         bool full() const { return capacity() == size(); }
 
@@ -748,8 +749,13 @@ class CircularBuffer {
         }
 
         void clear() {
+            /* clear storage in order to properly delete any items */
+            m_vec.clear();
+            m_vec.resize(m_capacity);
             m_size = 0;
+            // reset all pointers in case of reallocation
             m_buff = m_first = m_last = &m_vec[0];
+            m_end = &m_vec[m_capacity];
         }
 
         reference back() { return *((m_last == m_buff ? m_end : m_last) - 1); }
@@ -768,19 +774,32 @@ class CircularBuffer {
 
         /* check p whether it is between m_first and m_last */
         bool is_valid(const_pointer p) {
+            bool valid = true;
             /* empty buffer makes everything invalid */
-            if (empty()) return false;
+            if (empty()) {
+                valid = false;
+            }
             /* outside possible memory range of buffer, invalid */
-            if (p < m_buff || p >= m_end) return false;
+            else if (p < m_buff || p >= m_end) {
+                valid = false;
+            }
             /* case where virtual beginning and end are in order */
-            if (m_first < m_last) return m_first <= p && p < m_last;
+            else if (m_first < m_last) {
+                valid = m_first <= p && p < m_last;
+            }
             /* case where virtual beginning and end are swapped */
-            else return !(m_last <= p && p < m_first);
+            else {
+                valid = !(m_last <= p && p < m_first);
+            }
+            return valid;
         }
 
         /* move virtual beginning one past the given pointer */
         /* assumes p is valid */
         void gc(pointer p) {
+            if (!is_valid(p)) {
+                DBOUTL(DB_RESOURCE, "opvec=" << this << ": gc pointer " << p << " invalid!");
+            }
             size_type distance;
             if (p >= m_first) {
                 distance = p - m_first + 1;
@@ -788,9 +807,17 @@ class CircularBuffer {
             else {
                 distance = (m_end - m_first) + (p - m_buff);
             }
+            DBOUTL(DB_RESOURCE, "opvec=" << this << ": compacting by " << distance
+                    << " p=" << (p-m_buff)
+                    << " m_size=" << m_size
+                    << " m_first=" << (m_first-m_buff)
+                    << " m_last=" << (m_last-m_buff)
+                    << " m_buff=" << m_buff
+                    << " new size=" << (m_size-distance));
+            assert(distance <= m_size);
             m_size -= distance;
             m_first = p;
-            increment(p);
+            increment(m_first);
         }
 
         template <class UnaryPredicate>
@@ -810,6 +837,7 @@ class CircularBuffer {
 
     private:
         std::vector<T> m_vec;
+        size_type m_capacity; // original capacity of internal buffer, used during clear
         size_type m_size; // number of items currenlt stored
         pointer m_buff; // internal buffer's beginning (beginning of storage space)
         pointer m_end; // internal buffer's end (end of storage space)
@@ -1391,6 +1419,7 @@ private:
 
 
     bool         drainingQueue_;  // mode that we are draining queue, used to allow barrier ops to be enqueued.
+    bool         waitingQueue_;  // mode that we are actually waiting on the queue.
 
     //
     // kernel dispatches and barriers associated with this HSAQueue instance
@@ -1550,7 +1579,7 @@ public:
 
         if (!drainingQueue_ && (asyncOps.size() >= MAX_INFLIGHT_COMMANDS_PER_QUEUE-1)) {
             DBOUT(DB_WAIT, "*** Hit max inflight ops asyncOps.size=" << asyncOps.size() << ". " << op << " force sync\n");
-            DBOUT(DB_RESOURCE, "*** Hit max inflight ops asyncOps.size=" << asyncOps.size() << ". " << op << " force sync\n");
+            DBOUT(DB_RESOURCE, "opvec=" << &asyncOps << ": *** Hit max inflight ops asyncOps.size=" << asyncOps.size() << ". " << op << " force sync\n");
 
             drainingQueue_ = true;
 
@@ -1698,9 +1727,9 @@ public:
         // Go in reverse order (from youngest to oldest).
         // Ensures younger ops have chance to complete before older ops reclaim their resources
         //
+        waitingQueue_ = !drainingQueue_;
 
-
-        if (HCC_OPT_FLUSH && nextSyncNeedsSysRelease()) {
+        if (waitingQueue_ && HCC_OPT_FLUSH && nextSyncNeedsSysRelease()) {
 
             // In the loop below, this will be the first op waited on
             auto marker = EnqueueMarker(hc::system_scope);
@@ -1717,24 +1746,44 @@ public:
 
 
         bool foundFirstValidOp = false;
+        int oldAysncOpsSize = asyncOps.size();
+        int lastWaitOp = oldAysncOpsSize - 1;
+        if (drainingQueue_) {
+            lastWaitOp = oldAysncOpsSize / 2;
+            DBOUTL(DB_RESOURCE, "opvec=" << &asyncOps << ": ** draining asyncOps.size=" << asyncOps.size() << " starting at " << lastWaitOp);
+        }
+        else {
+            DBOUTL(DB_RESOURCE, "opvec=" << &asyncOps << ": ** legit waiting");
+        }
 
-        for (int i = asyncOps.size()-1; i >= 0;  i--) {
-            if (asyncOps[i] != nullptr) {
-                auto asyncOp = asyncOps[i];
+        // We can't use an index into asyncOps because future->wait() might trigger GC
+        // and shrink the index space. asyncOps.is_valid() will check for this.
+        for (OpIndex iter = &asyncOps[lastWaitOp]; asyncOps.is_valid(iter); asyncOps.decrement(iter)) {
+            if (*iter != nullptr) {
+                auto asyncOp = *iter;
+                /* the following code block asserts the signal; only needed if assert is enabled */
+#if !defined(NDEBUG)
                 if (!foundFirstValidOp) {
                     hsa_signal_t sig =  *(static_cast <hsa_signal_t*> (asyncOp->getNativeHandle()));
                     assert(sig.handle != 0);
                     foundFirstValidOp = true;
                 }
+#endif
                 // wait on valid futures only
                 std::shared_future<void>* future = asyncOp->getFuture();
                 if (future && future->valid()) {
                     future->wait();
                 }
             }
+            /* ops are in-order (see comment in removeAsyncOp) */
+            else {
+                break;
+            }
         }
-        // clear async operations table
-        asyncOps.clear();
+        if (waitingQueue_) {
+            // clear async operations table
+            asyncOps.clear();
+        }
    }
 
     void LaunchKernel(void *ker, size_t nr_dim, size_t *global, size_t *local) override {
@@ -2308,13 +2357,16 @@ public:
                     break; // stop searching if we find null, there cannot be any more valid pointers below.
                 }
             }
-        }
 
-
-        // GC for finished kernels
-        if (asyncOps.size() > HCC_ASYNCOPS_GC_SIZE) {
-            DBOUTL(DB_RESOURCE, "asyncOps size=" << asyncOps.size() << " exceeds collection size, compacting");
-            asyncOps.gc(targetIndex);
+            // GC for finished kernels
+            //if (!runningGC_ && !drainingQueue_ && asyncOps.size() > HCC_ASYNCOPS_GC_SIZE)
+            if (!waitingQueue_ && asyncOps.size() > HCC_ASYNCOPS_GC_SIZE)
+            {
+                //DBOUTL(DB_RESOURCE, "opvec=" << &asyncOps << " : asyncOps.size()=" << asyncOps.size() << " exceeds collection size, compacting");
+                //runningGC_ = true;
+                asyncOps.gc(targetIndex);
+                //runningGC_ = false;
+            }
         }
     }
 };
@@ -4106,7 +4158,7 @@ std::ostream& operator<<(std::ostream& os, const HSAQueue & hav)
 HSAQueue::HSAQueue(KalmarDevice* pDev, hsa_agent_t agent, execute_order order, queue_priority priority) :
     KalmarQueue(pDev, queuing_mode_automatic, order, priority),
     rocrQueue(nullptr),
-    asyncOps(2*MAX_INFLIGHT_COMMANDS_PER_QUEUE), drainingQueue_(false),
+    asyncOps(2*MAX_INFLIGHT_COMMANDS_PER_QUEUE), drainingQueue_(false), waitingQueue_(false),
     valid(true), _nextSyncNeedsSysRelease(false), _nextKernelNeedsSysAcquire(false), bufferKernelMap(), kernelBufferMap()
 {
     {
