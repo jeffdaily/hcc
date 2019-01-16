@@ -1439,7 +1439,7 @@ public:
 
         if (!drainingQueue_ && (asyncOps.size() >= MAX_INFLIGHT_COMMANDS_PER_QUEUE-1)) {
             DBOUT(DB_WAIT, "*** Hit max inflight ops asyncOps.size=" << asyncOps.size() << ". " << op << " force sync\n");
-            DBOUT(DB_RESOURCE, "*** Hit max inflight ops asyncOps.size=" << asyncOps.size() << ". " << op << " force sync\n");
+            DBOUT(DB_RESOURCE, "asyncOps=" << &asyncOps << " *** Hit max inflight ops asyncOps.size=" << asyncOps.size() << ". " << op << " force sync\n");
 
             drainingQueue_ = true;
 
@@ -1578,6 +1578,17 @@ public:
         return isEmpty;
     };
 
+    static void gc(std::vector< std::shared_ptr<HSAOp> > &asyncOps) {
+        size_t new_i = 0;
+        for (size_t i=0,end=asyncOps.size(); i<end; ++i) {
+            if (nullptr != asyncOps[i]) {
+                asyncOps[new_i] = std::move(asyncOps[i]);
+                asyncOps[new_i]->asyncOpsIndex(new_i);
+                ++new_i;
+            }
+        }
+        asyncOps.erase(asyncOps.begin()+new_i, asyncOps.end());
+    }
 
     // Must retain this exact function signature here even though mode not used since virtual interface in
     // runtime depends on this signature.
@@ -1588,7 +1599,7 @@ public:
         //
 
 
-        if (HCC_OPT_FLUSH && nextSyncNeedsSysRelease()) {
+        if (!drainingQueue_ && HCC_OPT_FLUSH && nextSyncNeedsSysRelease()) {
 
             // In the loop below, this will be the first op waited on
             auto marker = EnqueueMarker(hc::system_scope);
@@ -1611,6 +1622,8 @@ public:
             lastWaitOp = (oldAysncOpsSize * QUEUE_FLUSHING_FRAC) - 1;
         }
 
+        int count = 0;
+        int count2 = 0;
         for (int i = lastWaitOp; i >= 0;  i--) {
             if (asyncOps[i] != nullptr) {
                 auto asyncOp = asyncOps[i];
@@ -1622,14 +1635,32 @@ public:
                 // wait on valid futures only
                 std::shared_future<void>* future = asyncOp->getFuture();
                 if (future && future->valid()) {
+                    if (0 == count2) {
+                        DBOUTL(DB_RESOURCE, "asyncOps=" << &asyncOps << " valid future found at " << i);
+                    }
                     future->wait();
+                    ++count2;
                 }
             }
+            else {
+                if (0 == count) {
+                    DBOUTL(DB_RESOURCE, "asyncOps=" << &asyncOps << " nullptr found at " << i);
+                }
+                ++count;
+            }
         }
+        DBOUTL(DB_RESOURCE, "asyncOps=" << &asyncOps << " found " << count << " nullptrs in " << lastWaitOp+1 << " ops");
+        DBOUTL(DB_RESOURCE, "asyncOps=" << &asyncOps << " found " << count2 << " valid futures in " << lastWaitOp+1 << " ops");
         // clear async operations table
         if (drainingQueue_) {
+            DBOUTL(DB_RESOURCE, "asyncOps=" << &asyncOps << " " << oldAysncOpsSize << "==" << asyncOps.size()
+                    << " " << (asyncOps[lastWaitOp] == nullptr)
+                    << " " << (asyncOps[lastWaitOp-1] == nullptr)
+                    << " " << (asyncOps[lastWaitOp-2] == nullptr)
+                    << " " << (asyncOps[lastWaitOp-3] == nullptr)
+                    );
             if (oldAysncOpsSize == asyncOps.size()) {
-                asyncOps.erase(asyncOps.begin(), asyncOps.begin() + lastWaitOp);
+                gc(asyncOps);
             }
         }
         else {
@@ -1637,7 +1668,7 @@ public:
         }
 
         drainingQueue_ = false;
-   }
+    }
 
     void LaunchKernel(void *ker, size_t nr_dim, size_t *global, size_t *local) override {
         LaunchKernelWithDynamicGroupMemory(ker, nr_dim, global, local, 0);
@@ -2216,9 +2247,9 @@ public:
 
         // GC for finished kernels
         if (asyncOps.size() > ASYNCOPS_VECTOR_GC_SIZE) {
-            DBOUTL(DB_RESOURCE, "asyncOps size=" << asyncOps.size() << " exceeds collection size, compacting");
-            asyncOps.erase(std::remove(asyncOps.begin(), asyncOps.end(), nullptr),
-                         asyncOps.end());
+            auto size = asyncOps.size();
+            gc(asyncOps);
+            DBOUTL(DB_RESOURCE, "asyncOps=" << &asyncOps << " size=" << size << " exceeded collection size, compacted to " << asyncOps.size());
         }
     }
 };
