@@ -1447,22 +1447,24 @@ public:
                     << std::endl);
 
 
-        size_t size;
-        {
-            std::lock_guard<std::recursive_mutex> lg(qmutex);
-            size = asyncOps.size();
-        }
+        if (!drainingQueue_) {
+            size_t size;
+            {
+                std::lock_guard<std::recursive_mutex> lg(qmutex);
+                size = asyncOps.size();
+            }
 
-        if (!drainingQueue_ && (size >= HCC_MAX_INFLIGHT_COMMANDS_PER_QUEUE-1)) {
-            DBOUT(DB_WAIT, "*** Hit max inflight ops asyncOps.size=" << size << ". " << op << " force sync\n");
-            DBOUT(DB_RESOURCE, "asyncOps=" << &asyncOps << " *** Hit max inflight ops asyncOps.size=" << size << ". " << op << " force sync\n");
+            if (size >= HCC_MAX_INFLIGHT_COMMANDS_PER_QUEUE-1) {
+                DBOUT(DB_WAIT, "*** Hit max inflight ops asyncOps.size=" << size << ". " << op << " force sync\n");
+                DBOUT(DB_RESOURCE, "asyncOps=" << &asyncOps << " *** Hit max inflight ops asyncOps.size=" << size << ". " << op << " force sync\n");
 
-            if (!drain()) {
-                // draining queue failed, so truly force a wait
-                DBOUTL(DB_RESOURCE, "draining queue failed, truly forcing sync");
-                drainingQueue_ = true;
-                wait();
-                drainingQueue_ = false;
+                if (!drain()) {
+                    // draining queue failed, so truly force a wait
+                    DBOUTL(DB_RESOURCE, "draining queue failed, truly forcing sync");
+                    drainingQueue_ = true;
+                    wait();
+                    drainingQueue_ = false;
+                }
             }
         }
         {
