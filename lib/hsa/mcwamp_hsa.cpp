@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <future>
 #include <iostream>
@@ -1280,9 +1281,6 @@ private:
     std::recursive_mutex   qmutex;  // Protect structures for this KalmarQueue.  Currently just the hsaQueue.
 
 
-    bool         drainingQueue_;  // mode that we are draining queue, used to allow barrier ops to be enqueued.
-    bool         drainingQueueFailed_;  // indicate last attempt to drain queue failed
-
     //
     // kernel dispatches and barriers associated with this HSAQueue instance
     //
@@ -1291,7 +1289,7 @@ private:
     // HSAQueue::wait(), and all future objects in the KalmarAsyncOp objects
     // will be waited on.
     //
-    std::vector< std::shared_ptr<HSAOp> > asyncOps;
+    std::deque< std::shared_ptr<HSAOp> > asyncOps;
 
     // The asyncOps queue may have a portion of its HSAOps flushed.
     // The remaining HSAOps are moved to the front of the container.
@@ -1438,8 +1436,6 @@ public:
     // TODO - can convert to reference?
     void pushAsyncOp(std::shared_ptr<HSAOp> op) {
 
-        std::lock_guard<std::recursive_mutex> lg(qmutex);
-
         op->setSeqNumFromQueue();
 
         DBOUT(DB_CMD, "  pushing " << *op << " completion_signal="<< std::hex  << ((hsa_signal_t*)op->getNativeHandle())->handle << std::dec
@@ -1449,30 +1445,30 @@ public:
                     << std::endl);
 
 
+        size_t size;
+        {
+            std::lock_guard<std::recursive_mutex> lg(qmutex);
+            size = asyncOps.size();
+        }
 
-        if (!drainingQueueFailed_ && !drainingQueue_ && (asyncOps.size() >= HCC_MAX_INFLIGHT_COMMANDS_PER_QUEUE-1)) {
-            DBOUT(DB_WAIT, "*** Hit max inflight ops asyncOps.size=" << asyncOps.size() << ". " << op << " force sync\n");
-            DBOUT(DB_RESOURCE, "asyncOps=" << &asyncOps << " *** Hit max inflight ops asyncOps.size=" << asyncOps.size() << ". " << op << " force sync\n");
+        if (size >= HCC_MAX_INFLIGHT_COMMANDS_PER_QUEUE-1) {
+            DBOUT(DB_WAIT, "*** Hit max inflight ops asyncOps.size=" << size << ". " << op << " force sync\n");
+            DBOUT(DB_RESOURCE, "asyncOps=" << &asyncOps << " *** Hit max inflight ops asyncOps.size=" << size << ". " << op << " force sync\n");
 
-            drainingQueue_ = true;
-
-            wait();
-
-            drainingQueue_ = false;
-
-            if (drainingQueueFailed_) {
+            if (!drain()) {
                 // draining queue failed, so truly force a wait
                 DBOUTL(DB_RESOURCE, "draining queue failed, truly forcing sync");
                 wait();
-                drainingQueueFailed_ = false;
             }
         }
-        // If a fraction of the queue was flushed, maintain the per-op index
-        // into the original HSAOp container using asyncOps_offset.
-        op->asyncOpsIndex(asyncOps.size()+asyncOps_offset);
-        youngestCommandKind = op->getCommandKind();
-        asyncOps.push_back(std::move(op));
-
+        {
+            // If a fraction of the queue was flushed, maintain the per-op index
+            // into the original HSAOp container using asyncOps_offset.
+            std::lock_guard<std::recursive_mutex> lg(qmutex);
+            op->asyncOpsIndex(asyncOps.size()+asyncOps_offset);
+            youngestCommandKind = op->getCommandKind();
+            asyncOps.push_back(std::move(op));
+        }
 
         if (DBFLAG(DB_QUEUE)) {
             printAsyncOps(std::cerr);
@@ -1608,6 +1604,39 @@ public:
     };
 
 
+    bool drain() {
+        std::shared_future<void>* future = nullptr;
+        {
+            std::lock_guard<std::recursive_mutex> lg(qmutex);
+            int lastWaitOp = asyncOps.size() * HCC_QUEUE_FLUSHING_RATIO / 100;
+            // Locate the first marker with a valid future,
+            // starting some fraction of the way down the queue.
+            // Once a nullptr is located, it is guaranteed that all ops
+            // older than the located nullptr will also be nulltpr, so we can stop the search.
+            // We may also not find a nullptr, or not find a valid marker to wait upon.
+            for (int i = lastWaitOp-1; i >= 0;  i--) {
+                if (asyncOps[i] != nullptr) {
+                    auto asyncOp = asyncOps[i];
+                    if (asyncOp->getCommandKind() != hcCommandMarker) continue;
+                    // wait on valid futures only
+                    future = asyncOp->getFuture();
+                    if (future && future->valid()) {
+                        break;
+                    }
+                    future = nullptr;
+                }
+                else {
+                    break; // as soon as an op is found to be nullptr, we know the older ones are also
+                }
+            }
+        }
+        if (future) {
+            future->wait();
+            return true;
+        }
+        return false;
+    }
+
     // Must retain this exact function signature here even though mode not used since virtual interface in
     // runtime depends on this signature.
     void wait(hcWaitMode mode = hcWaitModeBlocked) override {
@@ -1617,9 +1646,9 @@ public:
         //
 
 
-        if (!drainingQueue_ && HCC_OPT_FLUSH && nextSyncNeedsSysRelease()) {
+        if (HCC_OPT_FLUSH && nextSyncNeedsSysRelease()) {
 
-            // In the loop below, this will be the first op waited on when not in draining mode
+            // In the loop below, this will be the first op waited on
             auto marker = EnqueueMarker(hc::system_scope);
 
             DBOUT(DB_CMD2, " Sys-release needed, enqueued marker into " << *this << " to release written data " << marker<<"\n");
@@ -1631,73 +1660,29 @@ public:
             printAsyncOps(std::cerr);
         }
 
-        std::lock_guard<std::recursive_mutex> lg(qmutex);
-
-        int first_nullptr = -1;
-        int lastWaitOp = asyncOps.size();
-        if (drainingQueue_) {
-            lastWaitOp = lastWaitOp * HCC_QUEUE_FLUSHING_RATIO / 100;
-        }
-
-        // Locate the first op that is not a nullptr, starting from the most recent op.
-        // The future->wait() might cause the op at the current index to become a nullptr,
-        // or it might cause older ops to become nullptrs. Once a nullptr is located, it is guaranteed
-        // that all ops older than the located nullptr will also be nulltpr, so we can stop the search.
-        // We may also not find a nullptr, or not find a valid op to wait upon.
-        for (int i = lastWaitOp-1; i >= 0;  i--) {
-            if (asyncOps[i] != nullptr) {
-                auto asyncOp = asyncOps[i];
-                // we only drain starting at first found marker
-                if (drainingQueue_ && asyncOp->getCommandKind() != hcCommandMarker) continue;
-                // wait on valid futures only
-                std::shared_future<void>* future = asyncOp->getFuture();
-                if (future && future->valid()) {
-                    future->wait();
+        std::shared_future<void>* future = nullptr;
+        {
+            std::lock_guard<std::recursive_mutex> lg(qmutex);
+            for (int i = asyncOps.size()-1; i >= 0;  i--) {
+                if (asyncOps[i] != nullptr) {
+                    auto asyncOp = asyncOps[i];
+                    // wait on valid futures only
+                    future = asyncOp->getFuture();
+                    if (future && future->valid()) {
+                        break;
+                    }
+                    future = nullptr;
+                }
+                else {
+                    break; // as soon as an op is found to be nullptr, we know the older ones are also
                 }
             }
-            else {
-                first_nullptr = i;
-                break; // as soon as an op is found to be nullptr, we know the older ones are also
-            }
         }
-        // Compress the queue if we are in draning mode.
-        if (drainingQueue_) {
-            // The first non-null op we waited on in the previous loop may have itself become a nullptr.
-            // If so, it is more ideal to compress the queue starting at this index since it removes
-            // an additional element.
-            if (asyncOps[lastWaitOp-1] == nullptr) {
-                first_nullptr = lastWaitOp-1;
-            }
-            // we can only safely clear from the first nullptr and older
-            if (first_nullptr >= 0) {
-                // We wish to compress the queue by moving all non-nullptr ops to the front of the container.
-                // The std approaches are:
-                // 1) asyncOps.erase(asyncOps.begin(), asyncOps.begin()+first_nullptr+1);
-                // 2) asyncOps.erase(std::remove(asyncOps.begin(), asyncOps.begin()+first_nullptr+1, nullptr), asyncOps.end());
-                // However, (1) and (2) are linear with the size of the vector.
-                // Further, (2) will additionally compare all elements to the value nullptr.
-                // We can do better than (2) because we know that all elements from 0..first_nullptr are nullptrs,
-                // so we can avoid the redundant checks of each element against nullptr.
-                // We can do better than (1) because we only need to move the non-null elements.
-                // We are still linear complexity, but we should be moving fewer elements than the entire vector.
-                // This loop moves the non-null ops to the front of the vector.
-                for (size_t i=first_nullptr+1,new_i=0,end=asyncOps.size(); i<end; ++i) {
-                    asyncOps[new_i++] = std::move(asyncOps[i]);
-                }
-                // Resize the vector so that push_back inserts after the last valid op.
-                // Update the offset so newly added ops maintain a correct internal index into the vector.
-                asyncOps.resize(asyncOps.size() - first_nullptr - 1);
-                asyncOps_offset += (first_nullptr + 1);
-                DBOUTL(DB_RESOURCE, "asyncOps=" << &asyncOps << " * erasing " << first_nullptr+1 << " ops. New size " << asyncOps.size());
-            }
-            else {
-                // We were not able to find a suitable nullptr index from which to compress.
-                // This is likely due to not finding a valid op to wait upon in the previous loop.
-                // Setting this flag will force the next drain attempt to become a true wait.
-                drainingQueueFailed_ = true;
-            }
+        if (future) {
+            future->wait();
         }
-        else {
+        {
+            std::lock_guard<std::recursive_mutex> lg(qmutex);
             asyncOps.clear();
             asyncOps_offset = 0;
         }
@@ -2243,12 +2228,12 @@ public:
 
         std::lock_guard<std::recursive_mutex> lg(qmutex);
 
-        // This function is attempting to remove an op from the asyncOps vector.
-        // The ops in the vector maintain an index into the vector for their own op.
+        // This function is attempting to remove an op from the asyncOps deque.
+        // The ops in the deque maintain an index into the deque for their own op.
         // Ideally, assert(asyncOps[asyncOp->asyncOpsIndex()].get() == asyncOp).
         // However, if the queue had a fraction of the ops drained, the index stored by the op
         // was not updated and is no longer correct, so we must subtract off an offset
-        // so that this targetIndex refers to the valid vector index for the given asyncOp argument.
+        // so that this targetIndex refers to the valid deque index for the given asyncOp argument.
         int targetIndex = asyncOp->asyncOpsIndex() - asyncOps_offset;
 
         // Make sure the opindex is still valid.
@@ -2284,11 +2269,11 @@ public:
                     break; // stop searching if we find null, there cannot be any more valid pointers below.
                 }
             }
+            // Erasing from front of deque should be efficient.
+            // Update the offset so newly added ops maintain a correct internal index into the vector.
+            asyncOps.erase(asyncOps.begin(), asyncOps.begin()+targetIndex+1);
+            asyncOps_offset += (targetIndex + 1);
         }
-
-        // We used to garbage collect nullptr entries from asyncOps here.
-        // However, all garbage collection now occurs during pushAsyncOp as needed.
-        // This avoids incorrect interactions between queue draining and old GC code.
     }
 };
 
@@ -4090,7 +4075,7 @@ std::ostream& operator<<(std::ostream& os, const HSAQueue & hav)
 HSAQueue::HSAQueue(KalmarDevice* pDev, hsa_agent_t agent, execute_order order, queue_priority priority) :
     KalmarQueue(pDev, queuing_mode_automatic, order, priority),
     rocrQueue(nullptr),
-    asyncOps(), asyncOps_offset(0), drainingQueue_(false), drainingQueueFailed_(false),
+    asyncOps(), asyncOps_offset(0),
     valid(true), _nextSyncNeedsSysRelease(false), _nextKernelNeedsSysAcquire(false), bufferKernelMap(), kernelBufferMap()
 {
     {
