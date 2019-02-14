@@ -1281,6 +1281,8 @@ private:
     std::recursive_mutex   qmutex;  // Protect structures for this KalmarQueue.  Currently just the hsaQueue.
 
 
+    bool         drainingQueue_;  // mode that we are draining queue, used to allow barrier ops to be enqueued.
+
     //
     // kernel dispatches and barriers associated with this HSAQueue instance
     //
@@ -1451,14 +1453,16 @@ public:
             size = asyncOps.size();
         }
 
-        if (size >= HCC_MAX_INFLIGHT_COMMANDS_PER_QUEUE-1) {
+        if (!drainingQueue_ && (size >= HCC_MAX_INFLIGHT_COMMANDS_PER_QUEUE-1)) {
             DBOUT(DB_WAIT, "*** Hit max inflight ops asyncOps.size=" << size << ". " << op << " force sync\n");
             DBOUT(DB_RESOURCE, "asyncOps=" << &asyncOps << " *** Hit max inflight ops asyncOps.size=" << size << ". " << op << " force sync\n");
 
             if (!drain()) {
                 // draining queue failed, so truly force a wait
                 DBOUTL(DB_RESOURCE, "draining queue failed, truly forcing sync");
+                drainingQueue_ = true;
                 wait();
+                drainingQueue_ = false;
             }
         }
         {
@@ -4075,7 +4079,7 @@ std::ostream& operator<<(std::ostream& os, const HSAQueue & hav)
 HSAQueue::HSAQueue(KalmarDevice* pDev, hsa_agent_t agent, execute_order order, queue_priority priority) :
     KalmarQueue(pDev, queuing_mode_automatic, order, priority),
     rocrQueue(nullptr),
-    asyncOps(), asyncOps_offset(0),
+    asyncOps(), asyncOps_offset(0), drainingQueue_(false),
     valid(true), _nextSyncNeedsSysRelease(false), _nextKernelNeedsSysAcquire(false), bufferKernelMap(), kernelBufferMap()
 {
     {
