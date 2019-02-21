@@ -1380,12 +1380,12 @@ public:
 
     int increment(int index) {
         // increment index, without using modulo
-        return ((index+1) == asyncOps.size() ? 0 : (index+1));
+        return ((index+1) == HCC_ASYNCOPS_SIZE ? 0 : (index+1));
     }
 
     int decrement(int index) {
         // decrement index, without using modulo
-        return (index == 0 ? asyncOps.size()-1 : index-1);
+        return (index == 0 ? HCC_ASYNCOPS_SIZE-1 : index-1);
     }
 
     std::shared_ptr<HSAOp> back() {
@@ -1399,8 +1399,8 @@ public:
     {
         std::lock_guard<std::recursive_mutex> lg(qmutex);
         hsa_signal_value_t oldv=0;
-        s << *this << " : " << asyncOps.size() << " op entries\n";
-        for (int i=0; i<asyncOps.size(); i++) {
+        s << *this << " : " << HCC_ASYNCOPS_SIZE << " op entries\n";
+        for (int i=0; i<HCC_ASYNCOPS_SIZE; i++) {
             const std::shared_ptr<HSAOp> &op = asyncOps[i];
             s << "index:" << std::setw(4) << i ;
             if (op != nullptr) {
@@ -1539,7 +1539,7 @@ public:
     int getPendingAsyncOps() override {
         std::lock_guard<std::recursive_mutex> lg(qmutex);
         int count = 0;
-        for (int i = 0; i < asyncOps.size(); ++i) {
+        for (int i = 0; i < HCC_ASYNCOPS_SIZE; ++i) {
             auto &asyncOp = asyncOps[i];
 
             if (asyncOp != nullptr) {
@@ -1610,7 +1610,7 @@ public:
         std::shared_future<void>* future = nullptr;
         {
             std::lock_guard<std::recursive_mutex> lg(qmutex);
-            for (int i = decrement(asyncOpsIndex), count = 0; count < asyncOps.size(); i = decrement(i), ++count) {
+            for (int i = decrement(asyncOpsIndex), count = 0; count < HCC_ASYNCOPS_SIZE; i = decrement(i), ++count) {
                 if (asyncOps[i] != nullptr) {
                     auto asyncOp = asyncOps[i];
                     // wait on valid futures only
