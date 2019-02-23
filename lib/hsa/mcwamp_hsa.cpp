@@ -972,7 +972,7 @@ public:
     }
 
 
-    std::shared_ptr<HSAOp> enqueueAsync(hc::memory_scope memory_scope);
+    void enqueueAsync(hc::memory_scope memory_scope);
 
     // wait for the barrier to complete
     void waitComplete();
@@ -1064,8 +1064,8 @@ public:
 
     void dispatchKernelWaitComplete();
 
-    std::shared_ptr<HSAOp> dispatchKernelAsyncFromOp();
-    std::shared_ptr<HSAOp> dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, bool allocSignal);
+    void dispatchKernelAsyncFromOp();
+    void dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, bool allocSignal);
 
     // dispatch a kernel asynchronously
     hsa_status_t dispatchKernel(hsa_queue_t* lockedHsaQueue, const void *hostKernarg,
@@ -1424,7 +1424,7 @@ public:
 
     // Save the command and type
     // This should only be called within a acquire/release rocr queue block
-    std::shared_ptr<HSAOp> pushAsyncOp(std::shared_ptr<HSAOp> op) {
+    void pushAsyncOp(std::shared_ptr<HSAOp> op) {
 
         op->setSeqNumFromQueue();
 
@@ -1434,10 +1434,6 @@ public:
                     << (op->getCommandKind() == hcCommandKernel ? ((static_cast<HSADispatch*> (op.get()))->getKernelName()) : "")  // change to getLongKernelName() for mangled name
                     << std::endl);
 
-        hsa_signal_t signal = *(static_cast <hsa_signal_t*> (op->getNativeHandle()));
-        if (!signal.handle) {
-            DBOUT(DB_RESOURCE, "pushing op without signal commandKind=" << getHcCommandKindString(youngestCommandKind) << std::endl);
-        }
         youngestCommandKind = op->getCommandKind();
         asyncOps[asyncOpsIndex] = std::move(op);
         asyncOpsIndex = increment(asyncOpsIndex);
@@ -1445,14 +1441,12 @@ public:
         if (DBFLAG(DB_QUEUE)) {
             printAsyncOps(std::cerr);
         }
-
-        return back();
     }
 
     // Save the command and type
     // This should only be called within a acquire/release rocr queue block
     // This call transfers ownership of the HSAOp to the queue
-    std::shared_ptr<HSAOp> pushAsyncOp(HSAOp *op) {
+    void pushAsyncOp(HSAOp *op) {
         return pushAsyncOp(std::move(std::shared_ptr<HSAOp>(op)));
     }
 
@@ -1573,13 +1567,11 @@ public:
                     this->rocrQueue = nullptr;
                 }
             }
-            //  it is not safe to EnqueueMarker -- tryStealRocrQueue is called exclusively by other threads
-            //else {
-            //    // youngest has no signal - enqueue a new one:
-            //    auto marker = EnqueueMarker(hc::system_scope);
-            //    DBOUTL(DB_CMD2, "Inside HSAQueue::tryStealRocrQueue and queue contained only no-signal ops, enqueued marker " << marker << " into " << *this);
-            //    return false;
-            //}
+            else {
+                // youngest has no signal - enqueue a new one:
+                auto marker = EnqueueMarker(hc::system_scope);
+                DBOUTL(DB_CMD2, "Inside HSAQueue::tryStealRocrQueue and queue contained only no-signal ops, enqueued marker " << marker << " into " << *this);
+            }
         }
 
         return stolen;
@@ -1688,7 +1680,8 @@ public:
         dispatch->setLaunchConfiguration(nr_dim, global, local, dynamic_group_size);
 
         // dispatch the kernel
-        auto sp_dispatch = dispatch->dispatchKernelAsyncFromOp();
+        dispatch->dispatchKernelAsyncFromOp();
+        auto sp_dispatch = back();
 
 
         if (hasArrayViewBufferDeps) {
@@ -2022,7 +2015,9 @@ public:
         HSABarrier *barrier = new HSABarrier(this, 0, nullptr);
 
         // enqueue the barrier
-        return barrier->enqueueAsync(release_scope);
+        barrier->enqueueAsync(release_scope);
+
+        return back();
     }
 
 
@@ -2095,7 +2090,9 @@ public:
             }
 
             // enqueue the barrier
-            return barrier->enqueueAsync(fenceScope);
+            barrier->enqueueAsync(fenceScope);
+
+            return back();
         } else {
             // throw an exception
             throw Kalmar::runtime_exception("Incorrect number of dependent signals passed to EnqueueMarkerWithDependency", count);
@@ -4234,11 +4231,11 @@ HSAQueue::dispatch_hsa_kernel(const hsa_kernel_dispatch_packet_t *aql,
         needsSignal = false;
     };
 
-    auto sp_dispatch = dispatch->dispatchKernelAsync(args, argSize, needsSignal);
+    dispatch->dispatchKernelAsync(args, argSize, needsSignal);
 
 
     if (cf) {
-        *cf = hc::completion_future(sp_dispatch);
+        *cf = hc::completion_future(back());
     }
 };
 
@@ -4508,16 +4505,14 @@ HSADispatch::dispatchKernelWaitComplete() {
 
 // Flavor used when launching dispatch with args and signal created by HCC
 // (As opposed to the dispatch_hsa_kernel path)
-inline std::shared_ptr<HSAOp>
+inline void
 HSADispatch::dispatchKernelAsyncFromOp()
 {
-    return dispatchKernelAsync(arg_vec.data(), arg_vec.size(), true);
+    dispatchKernelAsync(arg_vec.data(), arg_vec.size(), true);
 }
 
-inline std::shared_ptr<HSAOp>
+inline void
 HSADispatch::dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, bool allocSignal) {
-
-    std::shared_ptr<HSAOp> op;
 
     if (_activity_prof.is_enabled()) {
         allocSignal = true;
@@ -4540,7 +4535,7 @@ HSADispatch::dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, b
         STATUS_CHECK(status, __LINE__);
 
         // associate this Op with the queue
-        op = hsaQueue()->pushAsyncOp(this);
+        hsaQueue()->pushAsyncOp(this);
 
         hsaQueue()->releaseLockedRocrQueue();
     }
@@ -4554,8 +4549,6 @@ HSADispatch::dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, b
     if (HCC_SERIALIZE_KERNEL & 0x2) {
         future->wait();
     };
-
-    return op;
 }
 
 inline void
@@ -4772,10 +4765,8 @@ HSABarrier::waitComplete() {
 
 
 // TODO - remove hsaQueue parm.
-inline std::shared_ptr<HSAOp>
+inline void
 HSABarrier::enqueueAsync(hc::memory_scope fenceScope) {
-
-    std::shared_ptr<HSAOp> op;
 
     if (fenceScope == hc::system_scope) {
         hsaQueue()->setNextSyncNeedsSysRelease(false);
@@ -4869,7 +4860,7 @@ HSABarrier::enqueueAsync(hc::memory_scope fenceScope) {
         hsa_signal_store_relaxed(rocrQueue->doorbell_signal, index);
 
         // associate the barrier with this queue
-        op = hsaQueue()->pushAsyncOp(this);
+        hsaQueue()->pushAsyncOp(this);
 
         hsaQueue()->releaseLockedRocrQueue();
     }
@@ -4882,9 +4873,6 @@ HSABarrier::enqueueAsync(hc::memory_scope fenceScope) {
     future = new std::shared_future<void>(std::async(std::launch::deferred, [&] {
         waitComplete();
     }).share());
-
-
-    return op;
 }
 
 
