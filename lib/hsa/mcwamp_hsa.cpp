@@ -1273,8 +1273,6 @@ private:
     std::recursive_mutex   qmutex;  // Protect structures for this KalmarQueue.  Currently just the hsaQueue.
 
 
-    bool         drainingQueue_;  // mode that we are draining queue, used to allow barrier ops to be enqueued.
-
     //
     // kernel dispatches and barriers associated with this HSAQueue instance
     //
