@@ -45,6 +45,7 @@
 #include "hc_printf.hpp"
 
 #include <time.h>
+#include <sys/time.h>
 #include <iomanip>
 
 #define CHECK_OLDER_COMPLETE 0
@@ -126,6 +127,8 @@ int HCC_PROFILE=0;
 #define HCC_PROFILE_VERBOSE_OPSEQNUM                (1 << 2)   // 0x4
 #define HCC_PROFILE_VERBOSE_TID                     (1 << 3)   // 0x8
 #define HCC_PROFILE_VERBOSE_BARRIER                 (1 << 4)   // 0x10
+#define HCC_PROFILE_VERBOSE_TIME_REF                (1 << 5)   // 0x20
+#define HCC_PROFILE_VERBOSE_API                     (1 << 6)   // 0x40
 int HCC_PROFILE_VERBOSE=0x1F;
 
 
@@ -1171,6 +1174,24 @@ pool_iterator::pool_iterator()
 ///
 namespace Kalmar {
 
+suseconds_t get_host_timestamp() {
+	struct timeval tv;
+	gettimeofday(&tv, NULL);
+	return tv.tv_sec * 1e6 + tv.tv_usec;
+}
+
+void print_hcc_runtime_profile(
+		std::string prof_name,
+		suseconds_t ts,
+		suseconds_t time) {
+	if (time > 0) {
+		std::stringstream ss;
+		ss << "hcc-profile, prof_name " << prof_name <<
+			", ts " << ts <<
+			", time " << time << std::endl;
+		std::cerr << ss.str();
+	}
+}
 
 
 // Small wrapper around the hsa hardware queue (ie returned from hsa_queue_create(...).
@@ -1584,6 +1605,10 @@ public:
         // Ensures younger ops have chance to complete before older ops reclaim their resources
         //
 
+        suseconds_t start;
+        if (HCC_PROFILE_VERBOSE & HCC_PROFILE_VERBOSE_API) {
+            start = get_host_timestamp();
+        }
 
         if (HCC_OPT_FLUSH && nextSyncNeedsSysRelease()) {
 
@@ -1620,6 +1645,11 @@ public:
         }
         // clear async operations table
         asyncOps.clear();
+
+        if (HCC_PROFILE_VERBOSE & HCC_PROFILE_VERBOSE_API) {
+            suseconds_t time = get_host_timestamp() - start;
+            print_hcc_runtime_profile("wait", start, time);
+        }
    }
 
     void LaunchKernel(void *ker, size_t nr_dim, size_t *global, size_t *local) override {
@@ -3511,6 +3541,16 @@ public:
         initPrintfBuffer();
 
         init_success = true;
+
+        // print gpu and host time reference
+        if (HCC_PROFILE_VERBOSE & HCC_PROFILE_VERBOSE_TIME_REF) {
+          uint64_t gpu_time = getSystemTicks();
+          suseconds_t host_time = get_host_timestamp();
+          std::stringstream ss;
+          ss << "hcc-ts-ref, prof_name gpu_host_ts, unix_ts " << host_time <<
+            ", gpu_ts " << gpu_time << std::endl;
+          std::cerr << ss.str();
+        }
     }
 
     void releaseSignal(hsa_signal_t signal, int signalIndex) {
