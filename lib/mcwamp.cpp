@@ -378,13 +378,13 @@ private:
   RuntimeImpl* runtime;
 public:
   KalmarBootstrap() : runtime(nullptr) {
-    bool to_init = true;
+    bool to_init = false;
     char* lazyinit_env = getenv("HCC_LAZYINIT");
     if (lazyinit_env != nullptr) {
-      if (std::string("ON") == lazyinit_env) {
-        to_init = false;
-      } else if (strtol(lazyinit_env, nullptr, 0)) {
-        to_init = false;
+      if (std::string("OFF") == lazyinit_env) {
+        to_init = true;
+      } else if (strtol(lazyinit_env, nullptr, 1)) {
+        to_init = true;
       }
     }
 
