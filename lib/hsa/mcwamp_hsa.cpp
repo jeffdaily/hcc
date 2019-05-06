@@ -2235,6 +2235,7 @@ private:
     uint16_t workgroup_max_dim[3];
 
     std::map<std::string, HSAExecutable*> executables;
+    bool executables_loaded;
 
     hcAgentProfile profile;
 
@@ -2320,6 +2321,16 @@ public:
 
 
 private:
+
+    void load_executables_once() {
+        if (!executables_loaded) {
+            executables_loaded = true;
+            // get default queue on the device
+            std::shared_ptr<KalmarQueue> queue = get_default_queue();
+            // load kernels on the default queue for the device
+            CLAMP::LoadInMemoryProgram(queue.get());
+        }
+    }
 
     // NOTE: removeRocrQueue should only be called from HSAQueue::dispose
     // since there's an assumption on a specific locking sequence
@@ -2747,11 +2758,8 @@ public:
     }
 
     void* CreateKernel(const char* fun, Kalmar::KalmarQueue *queue) override {
-        // try load kernels lazily in case it was not done so at bootstrap
-        // due to HCC_LAZYINIT env var
-        if (executables.size() == 0) {
-          CLAMP::LoadInMemoryProgram(queue);
-        }
+        // try load kernels lazily in case it was not done so at bootstrap due to HCC_LAZYINIT env var
+        load_executables_once();
 
         std::string str(fun);
         HSAKernel *kernel = programs[str];
@@ -3172,6 +3180,9 @@ public:
     void* getSymbolAddress(const char* symbolName) override {
         hsa_status_t status;
 
+        // try load kernels lazily in case it was not done so at bootstrap due to HCC_LAZYINIT env var
+        load_executables_once();
+
         unsigned long* symbol_ptr = nullptr;
         if (executables.size() != 0) {
             // iterate through all HSA executables
@@ -3209,6 +3220,9 @@ public:
     void memcpySymbol(void* symbolAddr, void* hostptr, size_t count, size_t offset = 0, enum hcCommandKind kind = hcMemcpyHostToDevice) override {
         hsa_status_t status;
 
+        // try load kernels lazily in case it was not done so at bootstrap due to HCC_LAZYINIT env var
+        load_executables_once();
+
         if (executables.size() != 0) {
             // copy data
             if (kind == hcMemcpyHostToDevice) {
@@ -3227,6 +3241,10 @@ public:
 
     // FIXME: return values
     void memcpySymbol(const char* symbolName, void* hostptr, size_t count, size_t offset = 0, enum hcCommandKind kind = hcMemcpyHostToDevice) override {
+
+        // try load kernels lazily in case it was not done so at bootstrap due to HCC_LAZYINIT env var
+        load_executables_once();
+
         if (executables.size() != 0) {
             unsigned long* symbol_ptr = (unsigned long*)getSymbolAddress(symbolName);
             memcpySymbol(symbol_ptr, hostptr, count, offset, kind);
@@ -3889,7 +3907,7 @@ HSADevice::HSADevice(hsa_agent_t a, hsa_agent_t host, int x_accSeqNum) :
                                ri(),
                                useCoarseGrainedRegion(false),
                                kernargPool(), kernargPoolFlag(), kernargCursor(0), kernargPoolMutex(),
-                               executables(),
+                               executables(), executables_loaded(false),
                                path(), description(), hostAgent(host),
                                versionMajor(0), versionMinor(0), accSeqNum(x_accSeqNum), queueSeqNums(0) {
     DBOUT(DB_INIT, "HSADevice::HSADevice()\n");
