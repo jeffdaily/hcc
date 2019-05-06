@@ -413,7 +413,7 @@ public:
     if (lazyinit_env != nullptr) {
       if (std::string("OFF") == lazyinit_env) {
         to_init = true;
-      } else if (0 == strtol(lazyinit_env, nullptr, 0)) {
+      } else if (std::string("0") == lazyinit_env) {
         to_init = true;
       }
     }
