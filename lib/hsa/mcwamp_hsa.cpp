@@ -2235,7 +2235,7 @@ private:
     uint16_t workgroup_max_dim[3];
 
     std::map<std::string, HSAExecutable*> executables;
-    bool executables_loaded;
+    std::once_flag executables_loaded;
 
     hcAgentProfile profile;
 
@@ -2323,13 +2323,14 @@ public:
 private:
 
     void load_executables_once() {
-        if (!executables_loaded) {
-            executables_loaded = true;
-            // get default queue on the device
-            std::shared_ptr<KalmarQueue> queue = get_default_queue();
-            // load kernels on the default queue for the device
-            CLAMP::LoadInMemoryProgram(queue.get());
-        }
+        std::call_once(executables_loaded, [=]() {
+            if (executables.size() == 0) {
+                // get default queue on the device
+                std::shared_ptr<KalmarQueue> queue = get_default_queue();
+                // load kernels on the default queue for the device
+                CLAMP::LoadInMemoryProgram(queue.get());
+            }
+        });
     }
 
     // NOTE: removeRocrQueue should only be called from HSAQueue::dispose
@@ -3907,7 +3908,7 @@ HSADevice::HSADevice(hsa_agent_t a, hsa_agent_t host, int x_accSeqNum) :
                                ri(),
                                useCoarseGrainedRegion(false),
                                kernargPool(), kernargPoolFlag(), kernargCursor(0), kernargPoolMutex(),
-                               executables(), executables_loaded(false),
+                               executables(), executables_loaded(),
                                path(), description(), hostAgent(host),
                                versionMajor(0), versionMinor(0), accSeqNum(x_accSeqNum), queueSeqNums(0) {
     DBOUT(DB_INIT, "HSADevice::HSADevice()\n");
