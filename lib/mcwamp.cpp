@@ -276,11 +276,10 @@ ELFIO::section* find_section_if(ELFIO::elfio& reader, P p) {
 }
 
 
-static void read_code_bundles(std::vector<_code_bundle>& bundles) {
+static std::vector<std::vector<char>>& get_code_blobs() {
 
   static std::once_flag f;
   static std::vector<std::vector<char>> blobs{};
-  static char* bundles_data_start = nullptr;
 
   std::call_once(f, []() {
 
@@ -303,6 +302,14 @@ static void read_code_bundles(std::vector<_code_bundle>& bundles) {
       return 0;
     }, nullptr);
   });
+
+  return blobs;
+}
+
+static void read_code_bundles(std::vector<_code_bundle>& bundles) {
+
+  std::vector<std::vector<char>>& blobs = get_code_blobs();
+  static char* bundles_data_start = nullptr;
 
   for (auto &b : blobs) {
 
@@ -436,6 +443,12 @@ public:
         // load kernels on the default queue for the device
         CLAMP::LoadInMemoryProgram(queue.get());
       }
+    }
+    else {
+      // Instead of loading kernels, we still load code blobs eagerly.
+      // They are used later when the first kernel is requested.
+      // Return value is discarded here, but used by read_code_bundles().
+      (void)CLAMP::get_code_blobs();
     }
   }
 };
