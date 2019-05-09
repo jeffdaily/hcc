@@ -30,6 +30,7 @@ struct RuntimeImpl {
     m_PushArgImpl(nullptr),
     m_PushArgPtrImpl(nullptr),
     m_GetContextImpl(nullptr),
+    m_ShutdownImpl(nullptr),
     m_InitActivityCallbackImpl(nullptr),
     m_EnableActivityCallbackImpl(nullptr),
     m_GetCmdNameImpl(nullptr),
@@ -45,6 +46,7 @@ struct RuntimeImpl {
 
   ~RuntimeImpl() {
     if (m_RuntimeHandle) {
+      m_ShutdownImpl();
       dlclose(m_RuntimeHandle);
     }
   }
@@ -54,6 +56,7 @@ struct RuntimeImpl {
     m_PushArgImpl = (PushArgImpl_t) dlsym(m_RuntimeHandle, "PushArgImpl");
     m_PushArgPtrImpl = (PushArgPtrImpl_t) dlsym(m_RuntimeHandle, "PushArgPtrImpl");
     m_GetContextImpl= (GetContextImpl_t) dlsym(m_RuntimeHandle, "GetContextImpl");
+    m_ShutdownImpl= (ShutdownImpl_t) dlsym(m_RuntimeHandle, "ShutdownImpl");
     m_InitActivityCallbackImpl = (InitActivityCallbackImpl_t) dlsym(m_RuntimeHandle, "InitActivityCallbackImpl");
     m_EnableActivityCallbackImpl = (EnableActivityCallbackImpl_t) dlsym(m_RuntimeHandle, "EnableActivityCallbackImpl");
     m_GetCmdNameImpl = (GetCmdNameImpl_t) dlsym(m_RuntimeHandle, "GetCmdNameImpl");
@@ -67,6 +70,7 @@ struct RuntimeImpl {
   PushArgImpl_t m_PushArgImpl;
   PushArgPtrImpl_t m_PushArgPtrImpl;
   GetContextImpl_t m_GetContextImpl;
+  ShutdownImpl_t m_ShutdownImpl;
 
   // Activity profiling routines
   InitActivityCallbackImpl_t m_InitActivityCallbackImpl;

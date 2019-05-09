@@ -150,7 +150,7 @@ char * HCC_PROFILE_FILE=nullptr;
             sstream << "\t" << *op << ";";\
     }\
    sstream <<  msg << "\n";\
-   Kalmar::ctx.getHccProfileStream() << sstream.str();\
+   Kalmar::ctx->getHccProfileStream() << sstream.str();\
 }
 
 // Track a short thread-id, for debugging:
@@ -3560,6 +3560,19 @@ public:
 
         ReadHccEnv();
 
+        if (HCC_PROFILE) {
+            if (HCC_PROFILE_FILE==nullptr || !strcmp(HCC_PROFILE_FILE, "stderr")) {
+                hccProfileStream = &std::cerr;
+            } else if (!strcmp(HCC_PROFILE_FILE, "stdout")) {
+                hccProfileStream = &std::cout;
+            } else {
+                hccProfileFile.open(HCC_PROFILE_FILE, std::ios::out);
+                assert (!hccProfileFile.fail());
+
+                hccProfileStream = &hccProfileFile;
+            }
+        }
+
         // initialize HSA runtime
 
         DBOUT(DB_INIT,"HSAContext::HSAContext(): init HSA runtime");
@@ -3587,7 +3600,9 @@ public:
         Devices.resize(Devices.size() + agents.size());
         for (int i = 0; i < agents.size(); ++i) {
             hsa_agent_t agent = agents[i];
-            Devices[first_gpu_index + i] = new HSADevice(agent, host, i);
+            HSADevice* dev = new HSADevice(agent, host, i);
+            Devices[first_gpu_index + i] = dev;
+            agentToDeviceMap_.insert(std::pair<uint64_t, HSADevice*> (agent.handle, dev));
         }
 
         DBOUT(DB_INIT, "Setting GPU " << HCC_DEFAULT_GPU << " as the default accelerator\n");
@@ -3824,7 +3839,12 @@ public:
     }
 };
 
-static HSAContext ctx;
+// We do not want HSAContext to destruct during C++ static destructor ordering,
+// so we make it a pointer here. It will be created when this library is
+// dlopened, and it will be deleted by the mcwamp runtime prior to dlclose.
+// Due to the frequent use of this ctx member, we do not want the overhead of a
+// mutex to protect its one-time creation.
+static HSAContext* ctx = new HSAContext;
 
 } // namespace Kalmar
 
@@ -3883,19 +3903,6 @@ void HSAContext::ReadHccEnv()
     GET_ENV_INT    (HCC_PROFILE,         "Enable HCC kernel and data profiling.  1=summary, 2=trace");
     GET_ENV_INT    (HCC_PROFILE_VERBOSE, "Bitmark to control profile verbosity and format. 0x1=default, 0x2=show begin/end, 0x4=show barrier");
     GET_ENV_STRING (HCC_PROFILE_FILE,    "Set file name for HCC_PROFILE mode.  Default=stderr");
-
-    if (HCC_PROFILE) {
-        if (HCC_PROFILE_FILE==nullptr || !strcmp(HCC_PROFILE_FILE, "stderr")) {
-            ctx.hccProfileStream = &std::cerr;
-        } else if (!strcmp(HCC_PROFILE_FILE, "stdout")) {
-            ctx.hccProfileStream = &std::cout;
-        } else {
-            ctx.hccProfileFile.open(HCC_PROFILE_FILE, std::ios::out);
-            assert (!ctx.hccProfileFile.fail());
-
-            ctx.hccProfileStream = &ctx.hccProfileFile;
-        }
-    }
 
 };
 
@@ -4076,7 +4083,6 @@ HSADevice::HSADevice(hsa_agent_t a, hsa_agent_t host, int x_accSeqNum) :
     }
 
 
-    ctx.agentToDeviceMap_.insert(std::pair<uint64_t, HSADevice*> (agent.handle, this));
 
 }
 
@@ -4087,8 +4093,8 @@ HSADevice::getHSAAgent() override {
 
 static int get_seqnum_from_agent(hsa_agent_t hsaAgent)
 {
-    auto i = ctx.agentToDeviceMap_.find(hsaAgent.handle);
-    if (i != ctx.agentToDeviceMap_.end()) {
+    auto i = ctx->agentToDeviceMap_.find(hsaAgent.handle);
+    if (i != ctx->agentToDeviceMap_.end()) {
         return i->second->get_seqnum();
     } else {
         return -1;
@@ -4627,7 +4633,7 @@ HSADispatch::dispatchKernel(hsa_queue_t* lockedHsaQueue, const void *hostKernarg
         /*
          * Create a signal to wait for the dispatch to finish.
          */
-        std::pair<hsa_signal_t, int> ret = Kalmar::ctx.getSignal();
+        std::pair<hsa_signal_t, int> ret = Kalmar::ctx->getSignal();
         _signal = ret.first;
         _signalIndex = ret.second;
         q_aql->completion_signal = _signal;
@@ -4807,7 +4813,7 @@ HSADispatch::dispose() {
       future = nullptr;
     }
 
-    Kalmar::ctx.releaseSignal(_signal, _signalIndex);
+    Kalmar::ctx->releaseSignal(_signal, _signalIndex);
 }
 
 inline uint64_t
@@ -5069,7 +5075,7 @@ HSABarrier::enqueueAsync(hc::memory_scope fenceScope) {
     }
 
     // Create a signal to wait for the barrier to finish.
-    std::pair<hsa_signal_t, int> ret = Kalmar::ctx.getSignal();
+    std::pair<hsa_signal_t, int> ret = Kalmar::ctx->getSignal();
     _signal = ret.first;
     _signalIndex = ret.second;
 
@@ -5174,7 +5180,7 @@ HSABarrier::dispose() {
       future = nullptr;
     }
 
-    Kalmar::ctx.releaseSignal(_signal, _signalIndex);
+    Kalmar::ctx->releaseSignal(_signal, _signalIndex);
 }
 
 inline uint64_t
@@ -5209,7 +5215,7 @@ HSAOp::HSAOp(hc::HSAOpId id, Kalmar::KalmarQueue *queue, hc::hcCommandKind comma
     _activity_prof(id, _opCoord._queueId, _opCoord._deviceId)
 {
     _signal.handle=0;
-    apiStartTick = Kalmar::ctx.getSystemTicks();
+    apiStartTick = Kalmar::ctx->getSystemTicks();
 
     _activity_prof.initialize();
 };
@@ -5237,7 +5243,7 @@ HSACopy::HSACopy(Kalmar::KalmarQueue *queue, const void* src_, void* dst_, size_
 {
 
 
-    apiStartTick = Kalmar::ctx.getSystemTicks();
+    apiStartTick = Kalmar::ctx->getSystemTicks();
 }
 
 // wait for the async copy to complete
@@ -5370,7 +5376,7 @@ hsa_status_t HSACopy::hcc_memory_async_copy(Kalmar::hcCommandKind copyKind, cons
     hsa_signal_t depSignal = { .handle = 0x0 };
     {
         // Create a signal to wait for the async copy command to finish.
-        std::pair<hsa_signal_t, int> ret = Kalmar::ctx.getSignal();
+        std::pair<hsa_signal_t, int> ret = Kalmar::ctx->getSignal();
         _signal = ret.first;
         _signalIndex = ret.second;
 
@@ -5535,7 +5541,7 @@ hsa_status_t HSACopy::hcc_memory_async_copy_rect(Kalmar::hcCommandKind copyKind,
     hsa_signal_t depSignal = { .handle = 0x0 };
     {
         //Create a signal to wait for the async copy command to finish.
-        std::pair<hsa_signal_t, int> ret = Kalmar::ctx.getSignal();
+        std::pair<hsa_signal_t, int> ret = Kalmar::ctx->getSignal();
         _signal = ret.first;
         _signalIndex = ret.second; 
 
@@ -5686,11 +5692,11 @@ HSACopy::dispose() {
             LOG_PROFILE(this, start, end, "copy", getCopyCommandString(),  "\t" << sizeBytes << " bytes;\t" << sizeBytes/1024.0/1024 << " MB;\t" << bw << " GB/s;");
         }
         _activity_prof.report_gpu_timestamps<HSACopy>(this, sizeBytes);
-        Kalmar::ctx.releaseSignal(_signal, _signalIndex);
+        Kalmar::ctx->releaseSignal(_signal, _signalIndex);
     } else {
         if (HCC_PROFILE & HCC_PROFILE_TRACE) {
             uint64_t start = apiStartTick;
-            uint64_t end   = Kalmar::ctx.getSystemTicks();
+            uint64_t end   = Kalmar::ctx->getSystemTicks();
             double bw = (double)(sizeBytes)/(end-start) * (1000.0/1024.0) * (1000.0/1024.0);
             LOG_PROFILE(this, start, end, "copyslo", getCopyCommandString(),  "\t" << sizeBytes << " bytes;\t" << sizeBytes/1024.0/1024 << " MB;\t" << bw << " GB/s;");
         }
@@ -5722,7 +5728,7 @@ HSACopy::getStartTick() {
 
 inline uint64_t
 HSACopy::getSystemTicks() {
-    return Kalmar::ctx.getSystemTicks();
+    return Kalmar::ctx->getSystemTicks();
 }
 
 void
@@ -5913,7 +5919,15 @@ HSACopy::syncCopy() {
 // ----------------------------------------------------------------------
 
 extern "C" void *GetContextImpl() {
-  return &Kalmar::ctx;
+  return Kalmar::ctx;
+}
+
+extern "C" void ShutdownImpl() {
+  static std::mutex mtx;
+  std::lock_guard<std::mutex> lck{mtx};
+  if (Kalmar::ctx != nullptr) {
+    delete Kalmar::ctx;
+  }
 }
 
 extern "C" void PushArgImpl(void *ker, int idx, size_t sz, const void *v) {

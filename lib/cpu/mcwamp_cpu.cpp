@@ -9,6 +9,7 @@
 #include <cassert>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <vector>
 
 #include <kalmar_runtime.h>
@@ -83,10 +84,24 @@ public:
 };
 
 
-static CPUContext ctx;
+// We do not want CPUContext to destruct during C++ static destructor ordering,
+// so we make it a pointer here. It will be created when this library is
+// dlopened, and it will be deleted by the mcwamp runtime prior to dlclose.
+// Due to the frequent use of this ctx member, we do not want the overhead of a
+// mutex to protect its one-time creation.
+static CPUContext* ctx = new CPUContext;
 
 } // namespace Kalmar
 
 extern "C" void *GetContextImpl() {
-  return &Kalmar::ctx;
+  return Kalmar::ctx;
+}
+
+extern "C" void ShutdownImpl() {
+  static std::mutex mtx;
+  std::lock_guard<std::mutex> lck{mtx};
+  if (Kalmar::ctx != nullptr) {
+    delete Kalmar::ctx;
+    Kalmar::ctx = nullptr;
+  }
 }
