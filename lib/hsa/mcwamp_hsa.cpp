@@ -52,6 +52,15 @@
 
 #define CHECK_OLDER_COMPLETE 0
 
+#include <unistd.h>
+#include <sys/syscall.h>
+
+#ifdef SYS_gettid
+#define GETTID syscall(SYS_gettid)
+#else
+#error "SYS_gettid unavailable on this system"
+#endif
+
 // Used to mark pieces of HCC runtime which may be specific to AMD's HSA implementation.
 // Intended to help identify this code when porting to another HSA impl.
 // FIXME - The AMD_HSA path is experimental and should not be enabled in production
@@ -2001,6 +2010,8 @@ public:
         auto device = getDev();
         unsigned int physical_count = device->get_compute_unit_count();
         assert(physical_count > 0);
+        fprintf(stderr, "CU MASKING TEST: tid=%ld HSAQueue::set_cu_mask cu_mask.size()=%zu physical_count=%u\n",
+                GETTID, cu_mask.size(), physical_count);
 
         uint32_t temp = 0;
         uint32_t bit_index = 0;
@@ -2187,6 +2198,12 @@ hsa_status_t RocrQueue::setCuMask(HSAQueue *hccQueue) {
     hsa_status_t status = HSA_STATUS_SUCCESS;
 
     if (this->cu_arrays != hccQueue->cu_arrays) {
+        std::ostringstream os;
+        for (size_t i=0; i<hccQueue->cu_arrays.size(); i++) {
+            std::bitset<32> bits(hccQueue->cu_arrays[i]);
+            os << bits;
+        }
+        fprintf(stderr, "CU MASKING TEST: tid=%ld RocrQueue::setCuMask '%s'\n", GETTID, os.str().c_str());
         // Expensive operation:
         this->cu_arrays = hccQueue->cu_arrays;
         status = hsa_amd_queue_cu_set_mask(_hwQueue,  hccQueue->cu_arrays.size()*32, hccQueue->cu_arrays.data());
@@ -2263,6 +2280,7 @@ public:
                 foundRQ = new RocrQueue(agent, this->queue_size, thief, priority);
                 rocrQueues[priority].push_back(foundRQ);
                 DBOUT(DB_QUEUE, "Create new rocrQueue=" << foundRQ << " for thief=" << thief << "\n");
+                fprintf(stderr, "CU MASKING TEST: tid=%ld HSAQueue::createOrstealRocrQueue new RocrQueue=%p\n", GETTID, foundRQ);
                 return;
             }
         }
@@ -2278,6 +2296,7 @@ public:
                         DBOUT(DB_QUEUE, "Found unused rocrQueue=" << rq << " for thief=" << thief << ".  hwQueue=" << rq->_hwQueue << "\n")
                         // update the queue pointers to indicate the theft
                         rq->assignHccQueue(thief);
+                        fprintf(stderr, "CU MASKING TEST: tid=%ld HSAQueue::createOrstealRocrQueue found unused RocrQueue=%p\n", GETTID, rq);
                         return;
                     }
                 }
@@ -2292,6 +2311,7 @@ public:
                         DBOUT(DB_QUEUE, "Found unused rocrQueue=" << rq << " for thief=" << thief << ".  hwQueue=" << rq->_hwQueue << "\n")
                         // update the queue pointers to indicate the theft
                         rq->assignHccQueue(thief);
+                        fprintf(stderr, "CU MASKING TEST: tid=%ld HSAQueue::createOrstealRocrQueue found unused RocrQueue=%p on second pass\n", GETTID, rq);
                         return;
                     } else if (rq->_hccQueue != thief)  {
                         auto victimHccQueue = rq->_hccQueue;
@@ -2304,6 +2324,7 @@ public:
                             // update the queue pointers to indicate the theft:
                             rq->assignHccQueue(thief);
                             DBOUT(DB_QUEUE, "Stole existing rocrQueue=" << rq << " from victimHccQueue=" << victimHccQueue << " to hccQueue=" << thief << "\n")
+                            fprintf(stderr, "CU MASKING TEST: tid=%ld HSAQueue::createOrstealRocrQueue stole RocrQueue=%p\n", GETTID, rq);
                             return; // for
                         }
                     }
@@ -3774,6 +3795,7 @@ HSADevice::HSADevice(hsa_agent_t a, hsa_agent_t host, int x_accSeqNum) :
                                path(), description(), hostAgent(host),
                                versionMajor(0), versionMinor(0), accSeqNum(x_accSeqNum), queueSeqNums(0) {
     DBOUT(DB_INIT, "HSADevice::HSADevice()\n");
+    fprintf(stderr, "CU MASKING TEST: tid=%ld HSADevice::HSADevice device=%d agent=%lu\n", GETTID, x_accSeqNum, a.handle);
 
     hsa_status_t status = HSA_STATUS_SUCCESS;
 
@@ -3987,7 +4009,26 @@ HSAQueue::HSAQueue(KalmarDevice* pDev, hsa_agent_t agent, execute_order order, q
         std::lock_guard<std::recursive_mutex> l(this->qmutex);
 
         auto device = static_cast<Kalmar::HSADevice*>(this->getDev());
+        fprintf(stderr, "CU MASKING TEST: tid=%ld HSAQueue::HSAQueue device=%d agent=%lu order=%d priority=%d\n",
+                GETTID, device->get_seqnum(), agent.handle, order, priority);
         device->createOrstealRocrQueue(this, priority);
+        char *env = getenv("HCC_DEFAULT_CU_MASK");
+        if (env) {
+            unsigned long long value;
+            std::istringstream is(env);
+            is >> std::hex >> value;
+            std::bitset<64> bits(value);
+            std::vector<bool> bbits(64);
+            for (size_t i=0; i<64; i++) {
+                bbits[i] = bits[i];
+            }
+            if (set_cu_mask(bbits)) {
+                fprintf(stderr, "CU MASKING TEST: tid=%ld HSAQueue::HSAQueue HCC_DEFAULT_CU_MASK='%s' llu='%llu' SUCCESS\n", GETTID, env, value);
+            }
+            else {
+                fprintf(stderr, "CU MASKING TEST: tid=%ld HSAQueue::HSAQueue HCC_DEFAULT_CU_MASK='%s' llu='%llu' FAILED TO SET\n", GETTID, env, value);
+            }
+        }
     }
 
 
@@ -4059,7 +4100,7 @@ hsa_queue_t *HSAQueue::acquireLockedRocrQueue() {
     this->qmutex.lock();
     if (this->rocrQueue == nullptr) {
         auto device = static_cast<Kalmar::HSADevice*>(this->getDev());
-        device->createOrstealRocrQueue(this);
+        device->createOrstealRocrQueue(this, get_queue_priority());
     }
 
     DBOUT (DB_QUEUE, "acquireLockedRocrQueue returned hwQueue=" << this->rocrQueue->_hwQueue << "\n");
