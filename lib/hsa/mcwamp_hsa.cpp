@@ -733,8 +733,6 @@ protected:
     hsa_agent_t  _agent;
 
     activity_prof::ActivityProf _activity_prof;
-
-    hsa_status_t _wait_complete_status;
 };
 std::ostream& operator<<(std::ostream& os, const HSAOp & op);
 
@@ -829,7 +827,6 @@ public:
     ~HSACopy() {
         if (future) {
             future->wait();
-            STATUS_CHECK(_wait_complete_status, __LINE__);
         }
         dispose();
     }
@@ -838,7 +835,7 @@ public:
     hsa_status_t enqueueAsyncCopy2dCommand(size_t width, size_t height, size_t srcPitch, size_t dstPitch, const Kalmar::HSADevice *copyDevice, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo);
 
     // wait for the async copy to complete
-    hsa_status_t waitComplete();
+    void waitComplete();
 
     void dispose();
 
@@ -978,7 +975,6 @@ public:
 
     ~HSABarrier() {
         future->wait();
-        STATUS_CHECK(_wait_complete_status, __LINE__);
         dispose();
     }
 
@@ -986,7 +982,7 @@ public:
     hsa_status_t enqueueAsync(hc::memory_scope memory_scope);
 
     // wait for the barrier to complete
-    hsa_status_t waitComplete();
+    void waitComplete();
 
     void dispose();
 
@@ -1049,7 +1045,6 @@ public:
     ~HSADispatch() {
         if (future){
             future->wait();
-            STATUS_CHECK(_wait_complete_status, __LINE__);
         }
         dispose();
     }
@@ -1087,7 +1082,7 @@ public:
                                int hostKernargSize, bool allocSignal);
 
     // wait for the kernel to finish execution
-    hsa_status_t waitComplete();
+    void waitComplete();
 
     void dispose();
 
@@ -4559,12 +4554,11 @@ HSADispatch::dispatchKernel(hsa_queue_t* lockedHsaQueue, const void *hostKernarg
 
 
 // wait for the kernel to finish execution
-inline hsa_status_t
+inline void
 HSADispatch::waitComplete() {
-    _wait_complete_status = HSA_STATUS_SUCCESS;
     if (!isDispatched)  {
-        _wait_complete_status = HSA_STATUS_ERROR_INVALID_ARGUMENT;
-        return _wait_complete_status;
+        STATUS_CHECK(HSA_STATUS_ERROR_INVALID_ARGUMENT, __LINE__);
+        return;
     }
 
     if (_signal.handle) {
@@ -4589,17 +4583,16 @@ HSADispatch::waitComplete() {
     }
 
     isDispatched = false;
-
-    return _wait_complete_status;
 }
 
 inline hsa_status_t
 HSADispatch::dispatchKernelWaitComplete() {
-    _wait_complete_status = HSA_STATUS_SUCCESS;
+    hsa_status_t status = HSA_STATUS_SUCCESS;
 
     if (isDispatched) {
-        _wait_complete_status = HSA_STATUS_ERROR_INVALID_ARGUMENT;
-        return _wait_complete_status;
+        status = HSA_STATUS_ERROR_INVALID_ARGUMENT;
+        STATUS_CHECK(status, __LINE__);
+        return status;
     }
 
     // WaitComplete dispatches need to ensure all data is released to system scope
@@ -4616,17 +4609,16 @@ HSADispatch::dispatchKernelWaitComplete() {
         hsa_queue_t* rocrQueue = hsaQueue()->acquireLockedRocrQueue();
 
         // dispatch kernel
-        _wait_complete_status = dispatchKernel(rocrQueue, arg_vec.data(), arg_vec.size(), true);
-        STATUS_CHECK(_wait_complete_status, __LINE__);
+        status = dispatchKernel(rocrQueue, arg_vec.data(), arg_vec.size(), true);
+        STATUS_CHECK(status, __LINE__);
 
         hsaQueue()->releaseLockedRocrQueue();
     }
 
     // wait for completion
     waitComplete();
-    STATUS_CHECK(_wait_complete_status, __LINE__);
 
-    return _wait_complete_status;
+    return status;
 }
 
 
@@ -4677,7 +4669,6 @@ HSADispatch::dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, b
 
     if (HCC_SERIALIZE_KERNEL & 0x2) {
         future->wait();
-        STATUS_CHECK(_wait_complete_status, __LINE__);
     };
 
 
@@ -4890,12 +4881,11 @@ HSADispatch::setLaunchConfiguration(const int dims, size_t *globalDims, size_t *
 // ----------------------------------------------------------------------
 
 // wait for the barrier to complete
-inline hsa_status_t
+inline void
 HSABarrier::waitComplete() {
-    _wait_complete_status = HSA_STATUS_SUCCESS;
     if (!isDispatched)  {
-        _wait_complete_status = HSA_STATUS_ERROR_INVALID_ARGUMENT;
-        return _wait_complete_status;
+        STATUS_CHECK(HSA_STATUS_ERROR_INVALID_ARGUMENT, __LINE__);
+        return;
     }
 
     DBOUT(DB_WAIT,  "  wait for barrier " << *this << " completion with wait flag: " << waitMode << "  signal="<< std::hex  << _signal.handle << std::dec <<"...\n");
@@ -4925,8 +4915,6 @@ HSABarrier::waitComplete() {
 
     // clear reference counts for signal-less ops.
     asyncOpsWithoutSignal.clear();
-
-    return _wait_complete_status;
 }
 
 
@@ -5145,12 +5133,11 @@ HSACopy::HSACopy(Kalmar::KalmarQueue *queue, const void* src_, void* dst_, size_
 }
 
 // wait for the async copy to complete
-inline hsa_status_t
+inline void
 HSACopy::waitComplete() {
-    _wait_complete_status = HSA_STATUS_SUCCESS;
     if (!isSubmitted)  {
-        _wait_complete_status = HSA_STATUS_ERROR_INVALID_ARGUMENT;
-        return _wait_complete_status;
+        STATUS_CHECK(HSA_STATUS_ERROR_INVALID_ARGUMENT, __LINE__);
+        return;
     }
 
     // Wait on completion signal until the async copy is finishedS
@@ -5172,8 +5159,6 @@ HSACopy::waitComplete() {
 
     // clear reference counts for signal-less ops.
     asyncOpsWithoutSignal.clear();
-
-    return _wait_complete_status;
 }
 
 
@@ -5532,7 +5517,6 @@ HSACopy::enqueueAsyncCopyCommand(const Kalmar::HSADevice *copyDevice, const hc::
 
     if (HCC_SERIALIZE_COPY & 0x2) {
         future->wait();
-        STATUS_CHECK(_wait_complete_status, __LINE__);
     };
 
     return status;
