@@ -4576,6 +4576,10 @@ HSADispatch::waitComplete() {
         }
 
         DBOUT (DB_MISC, "complete!\n");
+
+        // clear reference counts for signal-less ops.
+        asyncOpsWithoutSignal.clear();
+
     } else {
         // Some commands may have null signal - in this case we can't actually
         // track their status so assume they are complete.
@@ -4919,6 +4923,9 @@ HSABarrier::waitComplete() {
         depAsyncOps[i] = nullptr;
     }
 
+    // clear reference counts for signal-less ops.
+    asyncOpsWithoutSignal.clear();
+
     return _wait_complete_status;
 }
 
@@ -5162,6 +5169,9 @@ HSACopy::waitComplete() {
 
     // clear reference counts for dependent ops.
     depAsyncOp = nullptr;
+
+    // clear reference counts for signal-less ops.
+    asyncOpsWithoutSignal.clear();
 
     return _wait_complete_status;
 }
