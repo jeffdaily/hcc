@@ -831,8 +831,8 @@ public:
         dispose();
     }
 
-    std::shared_ptr<KalmarAsyncOp> enqueueAsyncCopyCommand(const Kalmar::HSADevice *copyDevice, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo);
-    std::shared_ptr<KalmarAsyncOp> enqueueAsyncCopy2dCommand(size_t width, size_t height, size_t srcPitch, size_t dstPitch, const Kalmar::HSADevice *copyDevice, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo);
+    std::shared_ptr<Kalmar::KalmarAsyncOp> enqueueAsyncCopyCommand(const Kalmar::HSADevice *copyDevice, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo);
+    std::shared_ptr<Kalmar::KalmarAsyncOp> enqueueAsyncCopy2dCommand(size_t width, size_t height, size_t srcPitch, size_t dstPitch, const Kalmar::HSADevice *copyDevice, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo);
 
     // wait for the async copy to complete
     void waitComplete();
@@ -859,20 +859,18 @@ public:
     void syncCopyExt(hc::hcCommandKind copyDir,
                      const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo,
                      const Kalmar::HSADevice *copyDevice, bool forceUnpinnedCopy);
-    void syncCopy2DExt(hc::hcCommandKind copyDir,
+    hsa_status_t syncCopy2DExt(hc::hcCommandKind copyDir,
                      const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo,
                      size_t width, size_t height, size_t srcPitch, size_t dstPitch,
                      const Kalmar::HSADevice *copyDevice, bool forceUnpinnedCopy);
 
 
 private:
-    std::shared_ptr<KalmarAsyncOp> hcc_memory_async_copy(Kalmar::hcCommandKind copyKind,
-                                      const Kalmar::HSADevice *copyDevice,
+    hsa_status_t hcc_memory_async_copy(Kalmar::hcCommandKind copyKind, const Kalmar::HSADevice *copyDevice,
                                       const hc::AmPointerInfo &dstPtrInfo, const hc::AmPointerInfo &srcPtrInfo,
                                       size_t sizeBytes);
 
-    std::shared_ptr<KalmarAsyncOp> hcc_memory_async_copy_rect(Kalmar::hcCommandKind copyKind,
-                                      const Kalmar::HSADevice *copyDevice,
+    hsa_status_t hcc_memory_async_copy_rect(Kalmar::hcCommandKind copyKind, const Kalmar::HSADevice *copyDevice,
                                       const hc::AmPointerInfo &dstPtrInfo, const hc::AmPointerInfo &srcPtrInfo,
                                       size_t width, size_t height, size_t srcPitch, size_t dstPitch);
 
@@ -982,7 +980,7 @@ public:
     }
 
 
-    std::shared_ptr<KalmarAsyncOp> enqueueAsync(hc::memory_scope memory_scope);
+    std::shared_ptr<Kalmar::KalmarAsyncOp> enqueueAsync(hc::memory_scope memory_scope);
 
     // wait for the barrier to complete
     void waitComplete();
@@ -1077,12 +1075,12 @@ public:
 
     void dispatchKernelWaitComplete();
 
-    std::shared_ptr<KalmarAsyncOp> dispatchKernelAsyncFromOp();
-    std::shared_ptr<KalmarAsyncOp> dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, bool allocSignal);
+    std::shared_ptr<Kalmar::KalmarAsyncOp> dispatchKernelAsyncFromOp();
+    std::shared_ptr<Kalmar::KalmarAsyncOp> dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, bool allocSignal);
 
     // dispatch a kernel asynchronously
-    std::shared_ptr<KalmarAsyncOp> dispatchKernel(hsa_queue_t* lockedHsaQueue, const void *hostKernarg,
-                               int hostKernargSize, bool allocSignal);
+    std::shared_ptr<Kalmar::KalmarAsyncOp> dispatchKernel(hsa_queue_t* lockedHsaQueue, const void *hostKernarg,
+                                                          int hostKernargSize, bool allocSignal);
 
     // wait for the kernel to finish execution
     void waitComplete();
@@ -1445,13 +1443,12 @@ public:
     }
 
     // Save the command and type
-    std::shared_ptr<KalmarAsyncOp> pushAsyncOp(HSAOp *op_) {
+    std::shared_ptr<Kalmar::KalmarAsyncOp> pushAsyncOp(HSAOp *op_) {
 
-        // Lock is acquired outside of this function. Always.
-        //std::lock_guard<std::recursive_mutex> lg(qmutex);
+        std::lock_guard<std::recursive_mutex> lg(qmutex);
 
         // create the shared ptr version of the Op to be managed by this HSAQueue
-        std::shared_ptr<KalmarAsyncOp> op(op_);
+        std::shared_ptr<HSAOp> op(op_);
 
         op->setSeqNumFromQueue();
 
@@ -2176,7 +2173,7 @@ public:
     void copy_ext(const void *src, void *dst, size_t size_bytes, hc::hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo,
                   const Kalmar::KalmarDevice *copyDevice, bool forceUnpinnedCopy) override ;
 
-    void copy2d_ext(const void *src, void *dst, size_t width, size_t height, size_t srcPitch, size_t dstPitch, hc::hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo, const Kalmar::KalmarDevice *copyDevice, bool forceUnpinnedCopy);
+    bool copy2d_ext(const void *src, void *dst, size_t width, size_t height, size_t srcPitch, size_t dstPitch, hc::hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo, const Kalmar::KalmarDevice *copyDevice, bool forceUnpinnedCopy);
 
     void copy_ext(const void *src, void *dst, size_t size_bytes, hc::hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo, bool foo) override ;
 
@@ -3623,7 +3620,7 @@ public:
 
     void releaseSignal(hsa_signal_t signal) {
         if (signal.handle) {
-			DBOUT(DB_SIG, "  releaseSignal: 0x" << std::hex << signal.handle << std::dec << "\n");
+            DBOUT(DB_SIG, "  releaseSignal: 0x" << std::hex << signal.handle << std::dec << "\n");
             hsa_status_t status = hsa_signal_destroy(signal);
             STATUS_CHECK(status, __LINE__);
         }
@@ -4151,7 +4148,8 @@ void HSAQueue::copy_ext(const void *src, void *dst, size_t size_bytes, hc::hcCom
     copy_ext(src, dst, size_bytes, copyDir, srcPtrInfo, dstPtrInfo, copyDevice);
 }
 
-void HSAQueue::copy2d_ext(const void *src, void *dst, size_t width, size_t height, size_t srcPitch, size_t dstPitch, hc::hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo, const Kalmar::KalmarDevice *copyDevice, bool forceUnpinnedCopy) {
+bool HSAQueue::copy2d_ext(const void *src, void *dst, size_t width, size_t height, size_t srcPitch, size_t dstPitch, hc::hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo, const Kalmar::KalmarDevice *copyDevice, bool forceUnpinnedCopy) {
+    bool retStatus = true;
     this->wait();
 
     const Kalmar::HSADevice *copyDeviceHsa = static_cast<const Kalmar::HSADevice*> (copyDevice);
@@ -4159,9 +4157,13 @@ void HSAQueue::copy2d_ext(const void *src, void *dst, size_t width, size_t heigh
     HSACopy* copyCommand = new HSACopy(this, src, dst, width*height);
     copyCommand->setCommandKind(copyDir);
 
-    copyCommand->syncCopy2DExt(copyDir, srcPtrInfo, dstPtrInfo, width, height, srcPitch, dstPitch,copyDeviceHsa, forceUnpinnedCopy);
+    hsa_status_t status = copyCommand->syncCopy2DExt(copyDir, srcPtrInfo, dstPtrInfo, width, height, srcPitch, dstPitch,copyDeviceHsa, forceUnpinnedCopy);
 
     delete(copyCommand);
+    if(status != HSA_STATUS_SUCCESS)
+        retStatus = false;
+
+    return retStatus;
 };
 
 std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopyExt(const void* src, void* dst, size_t size_bytes,
@@ -4399,7 +4401,7 @@ static void printKernarg(const void *kernarg_address, int bytesToPrint)
 
 // dispatch a kernel asynchronously
 // -  allocates signal, copies arguments into kernarg buffer, and places aql packet into queue.
-std::shared_ptr<KalmarAsyncOp>
+std::shared_ptr<Kalmar::KalmarAsyncOp>
 HSADispatch::dispatchKernel(hsa_queue_t* lockedHsaQueue, const void *hostKernarg,
                             int hostKernargSize, bool allocSignal) {
     if (isDispatched) {
@@ -4553,13 +4555,13 @@ HSADispatch::dispatchKernelWaitComplete() {
 
 // Flavor used when launching dispatch with args and signal created by HCC
 // (As opposed to the dispatch_hsa_kernel path)
-inline std::shared_ptr<KalmarAsyncOp>
+inline std::shared_ptr<Kalmar::KalmarAsyncOp>
 HSADispatch::dispatchKernelAsyncFromOp()
 {
     return dispatchKernelAsync(arg_vec.data(), arg_vec.size(), true);
 }
 
-inline std::shared_ptr<KalmarAsyncOp>
+inline std::shared_ptr<Kalmar::KalmarAsyncOp>
 HSADispatch::dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, bool allocSignal) {
     std::shared_ptr<KalmarAsyncOp> op;
 
@@ -4844,7 +4846,7 @@ HSABarrier::waitComplete() {
 
 
 // TODO - remove hsaQueue parm.
-inline std::shared_ptr<KalmarAsyncOp>
+inline std::shared_ptr<Kalmar::KalmarAsyncOp>
 HSABarrier::enqueueAsync(hc::memory_scope fenceScope) {
 
     hc::memory_scope toDoReleaseFenceScope = fenceScope;
@@ -5099,11 +5101,9 @@ void checkCopy(const void *s1, const void *s2, size_t sizeBytes)
 
 // Small wrapper that calls hsa_amd_memory_async_copy.
 // HCC knows exactly which copy-engine it wants to perfom the copy and has already made.
-std::shared_ptr<KalmarAsyncOp> HSACopy::hcc_memory_async_copy(
-                      Kalmar::hcCommandKind copyKind, const Kalmar::HSADevice *copyDeviceArg,
+hsa_status_t HSACopy::hcc_memory_async_copy(Kalmar::hcCommandKind copyKind, const Kalmar::HSADevice *copyDeviceArg,
                       const hc::AmPointerInfo &dstPtrInfo, const hc::AmPointerInfo &srcPtrInfo, size_t sizeBytes)
 {
-    std::shared_ptr<KalmarAsyncOp> op;
     this->isSingleStepCopy = true;
 
     // beautiful...:
@@ -5267,14 +5267,8 @@ std::shared_ptr<KalmarAsyncOp> HSACopy::hcc_memory_async_copy(
                    << ",depSignalCnt=" << depSignalCnt << "," << &depSignal << ","
                    << std::hex << _signal.handle << "\n" << std::dec);
 
-    {
-        // we need the lock for the pushAsyncOp call
-        // TODO review if we need to lock around the copy
-        std::lock_guard<std::recursive_mutex> lg(qmutex);
-        status = hsa_amd_memory_async_copy(dstPtr, dstAgent, srcPtr, srcAgent, sizeBytes,
-                                             depSignalCnt, depSignalCnt?&depSignal:nullptr, _signal);
-        op = hsaQueue()->pushAsyncOp(this);
-    }
+    status = hsa_amd_memory_async_copy(dstPtr, dstAgent, srcPtr, srcAgent, sizeBytes,
+                                         depSignalCnt, depSignalCnt?&depSignal:nullptr, _signal);
 
     if (status != HSA_STATUS_SUCCESS) {
         throw Kalmar::runtime_exception("hsa_amd_memory_async_copy error", status);
@@ -5292,15 +5286,13 @@ std::shared_ptr<KalmarAsyncOp> HSACopy::hcc_memory_async_copy(
     hsaQueue()->setNextKernelNeedsSysAcquire(true);
 
     isSubmitted = true;
-    return op;
+    return status;
 }
 
-std::shared_ptr<KalmarAsyncOp> HSACopy::hcc_memory_async_copy_rect(
-                      Kalmar::hcCommandKind copyKind, const Kalmar::HSADevice *copyDeviceArg,
+hsa_status_t HSACopy::hcc_memory_async_copy_rect(Kalmar::hcCommandKind copyKind, const Kalmar::HSADevice *copyDeviceArg,
                       const hc::AmPointerInfo &dstPtrInfo, const hc::AmPointerInfo &srcPtrInfo, size_t width,
                       size_t height, size_t srcPitch, size_t dstPitch)
 {
-    std::shared_ptr<KalmarAsyncOp> op;
     this->isSingleStepCopy = true;
 
     hsa_agent_t copyAgent = * static_cast<hsa_agent_t*>(const_cast<Kalmar::HSADevice*>(copyDeviceArg)->getHSAAgent());
@@ -5399,19 +5391,17 @@ std::shared_ptr<KalmarAsyncOp> HSACopy::hcc_memory_async_copy_rect(
         }
     }
 
-    {
-        // we need the lock for the pushAsyncOp call
-        // TODO review if we need to lock around the copy
-        std::lock_guard<std::recursive_mutex> lg(qmutex);
-        status = hsa_amd_memory_async_copy_rect(&dst, &dstOff, &src, &srcOff, &range, copyAgent, hsa_amd_copy_direction_t(copyKind),depSignalCnt, depSignalCnt ? &depSignal:NULL,_signal);
-        op = hsaQueue()->pushAsyncOp(this);
+    status = hsa_amd_memory_async_copy_rect(&dst, &dstOff, &src, &srcOff, &range, copyAgent, hsa_amd_copy_direction_t(copyKind),depSignalCnt, depSignalCnt ? &depSignal:NULL,_signal);
+
+    if (status != HSA_STATUS_SUCCESS) {
+        return status;
     }
 
     DBOUT( DB_CMD2, "  copy setNextKernelNeedsSysAcquire(true)\n");
     hsaQueue()->setNextKernelNeedsSysAcquire(true);
 
     isSubmitted = true;
-    return op;
+    return status;
 }
 
 static Kalmar::hcCommandKind resolveMemcpyDirection(bool srcInDeviceMem, bool dstInDeviceMem)
@@ -5430,7 +5420,7 @@ static Kalmar::hcCommandKind resolveMemcpyDirection(bool srcInDeviceMem, bool ds
     }
 }
 
-inline std::shared_ptr<KalmarAsyncOp>
+inline std::shared_ptr<Kalmar::KalmarAsyncOp>
 HSACopy::enqueueAsyncCopyCommand(const Kalmar::HSADevice *copyDevice, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo) {
 
     if (HCC_SERIALIZE_COPY & 0x1) {
@@ -5447,7 +5437,9 @@ HSACopy::enqueueAsyncCopyCommand(const Kalmar::HSADevice *copyDevice, const hc::
 
     isAsync = true;
     setCommandKind (resolveMemcpyDirection(srcPtrInfo._isInDeviceMem, dstPtrInfo._isInDeviceMem));
-    auto op = hcc_memory_async_copy(getCommandKind(), copyDevice, dstPtrInfo, srcPtrInfo, sizeBytes);
+    hsa_status_t status = hcc_memory_async_copy(getCommandKind(), copyDevice, dstPtrInfo, srcPtrInfo, sizeBytes);
+    STATUS_CHECK(status, __LINE__);
+    auto op = hsaQueue()->pushAsyncOp(this);
 
     // dynamically allocate a std::shared_future<void> object
     future = new std::shared_future<void>(std::async(std::launch::deferred, [&] {
@@ -5461,7 +5453,7 @@ HSACopy::enqueueAsyncCopyCommand(const Kalmar::HSADevice *copyDevice, const hc::
     return op;
 }
 
-inline std::shared_ptr<KalmarAsyncOp>
+inline std::shared_ptr<Kalmar::KalmarAsyncOp>
 HSACopy::enqueueAsyncCopy2dCommand(size_t width, size_t height, size_t srcPitch, size_t dstPitch, 
                                     const Kalmar::HSADevice *copyDevice, 
                                     const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo) {
@@ -5476,9 +5468,11 @@ HSACopy::enqueueAsyncCopy2dCommand(size_t width, size_t height, size_t srcPitch,
 
     isAsync = true;
     setCommandKind (resolveMemcpyDirection(srcPtrInfo._isInDeviceMem, dstPtrInfo._isInDeviceMem));
-    auto op = hcc_memory_async_copy_rect(getCommandKind(), copyDevice,
-                                         dstPtrInfo, srcPtrInfo,
-                                         width, height, srcPitch, dstPitch);
+    hsa_status_t status = hcc_memory_async_copy_rect(getCommandKind(), copyDevice,
+                                                      dstPtrInfo, srcPtrInfo,
+                                                      width, height, srcPitch, dstPitch);
+    STATUS_CHECK(status, __LINE__);
+    auto op = hsaQueue()->pushAsyncOp(this);
 
     //dynamically allocate a std::shared_future<void> object
     future = new std::shared_future<void>(std::async(std::launch::deferred, [&] {
@@ -5633,8 +5627,16 @@ HSACopy::syncCopyExt(hc::hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrI
         if (copyDevice == nullptr) {
             throw Kalmar::runtime_exception("Null copyDevice reached call to hcc_memory_async_copy", -1);
         }
-        auto op = hcc_memory_async_copy(copyDir, copyDevice, dstPtrInfo, srcPtrInfo, sizeBytes);
-        op->waitComplete();
+        hsa_status_t hsa_status = hcc_memory_async_copy(copyDir, copyDevice, dstPtrInfo, srcPtrInfo, sizeBytes);
+
+        if (hsa_status == HSA_STATUS_SUCCESS) { 
+            DBOUT(DB_COPY, "HSACopy::syncCopyExt(), wait for completion...");   
+            hsa_signal_wait_relaxed(_signal, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, waitMode); 
+            DBOUT(DB_COPY,"done!\n");   
+        } else {
+            DBOUT(DB_COPY, "HSACopy::syncCopyExt(), hsa_amd_memory_async_copy() returns: 0x" << std::hex << hsa_status << std::dec <<"\n"); 
+            throw Kalmar::runtime_exception("hsa_amd_memory_async_copy error", hsa_status); 
+        }
     }
     if (HCC_CHECK_COPY) {
         checkCopy(dst, src, sizeBytes);
@@ -5652,7 +5654,8 @@ hsa_status_t HSACopy::syncCopy2DExt(hc::hcCommandKind copyDir,
         throw Kalmar::runtime_exception("Null copyDevice can only be used with HostToHost or DeviceToDevice copy", -1);
     }
 
-    hsa_signal_store_relaxed(_signal, 1);
+    // redundant, since hcc_memory_async_copy_rect creates the signal with initial value 1
+    //hsa_signal_store_relaxed(_signal, 1);
     hsa_status_t hsa_status = hcc_memory_async_copy_rect(copyDir, copyDevice, dstPtrInfo, srcPtrInfo, width, height, srcPitch, dstPitch);
     if (hsa_status == HSA_STATUS_SUCCESS) {
         DBOUT(DB_COPY, "HSACopy::syncCopy2DExt(), wait for completion...");
