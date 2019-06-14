@@ -119,6 +119,8 @@ int HCC_MAX_QUEUES = 20;
 #define HCC_PROFILE_SUMMARY (1<<0)
 #define HCC_PROFILE_TRACE   (1<<1)
 int HCC_PROFILE=0;
+int HCC_FLUSH_ON_WAIT=0;
+int HCC_FLUSH_ON_DEL=0;
 
 
 #define HCC_PROFILE_VERBOSE_BASIC                   (1 << 0)   // 0x1
@@ -904,7 +906,6 @@ public:
     // array of all operations that this op depends on.
     // This array keeps a reference which prevents those ops from being deleted until this op is deleted.
     std::shared_ptr<HSAOp> depAsyncOps [HSA_BARRIER_DEP_SIGNAL_CNT];
-    std::string depAsyncOpsStr;
 
 public:
     std::shared_future<void>* getFuture() override { return future; }
@@ -1673,6 +1674,21 @@ public:
             DBOUT(DB_CMD2, "No future found in wait, enqueued marker into " << *this << "\n");
         }
         back()->getFuture()->wait();
+        if (HCC_FLUSH_ON_WAIT) {
+            // aggressively cleanup resources so that we might get profiles prior to program termination
+            // but keep back() as a valid HSAOp, so decrement current insert index twice
+            int count = 0;
+            int index = decrement(decrement(asyncOpsIndex));
+            while (asyncOps[index] != nullptr || count > HCC_ASYNCOPS_SIZE) {
+                asyncOps[index] = nullptr;
+                index = decrement(index);
+                count++;
+            }
+            DBOUT(DB_CMD2, "HSAQueue::wait() freed " << count << " ops\n");
+            if (count > HCC_ASYNCOPS_SIZE) {
+                DBOUT(DB_CMD2, "HSAQueue::wait() exceeded async size\n");
+            }
+        }
     }
 
     void LaunchKernel(void *ker, size_t nr_dim, size_t *global, size_t *local) override {
@@ -3793,6 +3809,8 @@ void HSAContext::ReadHccEnv()
     GET_ENV_INT    (HCC_PROFILE,         "Enable HCC kernel and data profiling.  1=summary, 2=trace");
     GET_ENV_INT    (HCC_PROFILE_VERBOSE, "Bitmark to control profile verbosity and format. 0x1=default, 0x2=show begin/end, 0x4=show barrier");
     GET_ENV_STRING (HCC_PROFILE_FILE,    "Set file name for HCC_PROFILE mode.  Default=stderr");
+    GET_ENV_INT    (HCC_FLUSH_ON_WAIT,   "1==clear all resources on queue wait, 0==lazy (default)");
+    GET_ENV_INT    (HCC_FLUSH_ON_DEL,   "1==clear all resources on queue delete, 0==lazy (default)");
 
 };
 
@@ -4056,6 +4074,20 @@ void HSAQueue::dispose() override {
         // clear asyncOps to trigger any lingering resource cleanup while we still hold the locks
         // this implicitly waits on all remaining async ops as they destruct, including the
         // possible marker from above
+        if (HCC_FLUSH_ON_DEL) {
+            // aggressively cleanup resources so that we might get profiles prior to program termination
+            int count = 0;
+            int index = decrement(asyncOpsIndex);
+            while (asyncOps[index] != nullptr || count > HCC_ASYNCOPS_SIZE) {
+                asyncOps[index] = nullptr;
+                index = decrement(index);
+                count++;
+            }
+            DBOUT(DB_CMD2, "HSAQueue::wait() freed " << count << " ops\n");
+            if (count > HCC_ASYNCOPS_SIZE) {
+                DBOUT(DB_CMD2, "HSAQueue::wait() exceeded async size\n");
+            }
+        }
         asyncOps.clear();
 
         this->valid = false;
@@ -4588,6 +4620,16 @@ HSADispatch::waitComplete() {
         DBOUT (DB_MISC, "null signal, considered complete\n");
     }
 
+    if (HCC_PROFILE & HCC_PROFILE_TRACE) {
+        uint64_t start = getBeginTimestamp();
+        uint64_t end   = getEndTimestamp();
+        //std::string kname = kernel ? (kernel->kernelName + "+++" + kernel->shortKernelName) : "hmm";
+        //LOG_PROFILE(this, start, end, "kernel", kname.c_str(), std::hex << "kernel="<< kernel << " " << (kernel? kernel->kernelCodeHandle:0x0) << " aql.kernel_object=" << aql.kernel_object << std::dec);
+        LOG_PROFILE(this, start, end, "kernel", getKernelName(), "");
+    }
+
+    _activity_prof.report_gpu_timestamps<HSADispatch>(this);
+
     isDispatched = false;
 
     return _wait_complete_status;
@@ -4695,16 +4737,6 @@ HSADispatch::dispose() {
 
     clearArgs();
     std::vector<uint8_t>().swap(arg_vec);
-
-    if (HCC_PROFILE & HCC_PROFILE_TRACE) {
-        uint64_t start = getBeginTimestamp();
-        uint64_t end   = getEndTimestamp();
-        //std::string kname = kernel ? (kernel->kernelName + "+++" + kernel->shortKernelName) : "hmm";
-        //LOG_PROFILE(this, start, end, "kernel", kname.c_str(), std::hex << "kernel="<< kernel << " " << (kernel? kernel->kernelCodeHandle:0x0) << " aql.kernel_object=" << aql.kernel_object << std::dec);
-        LOG_PROFILE(this, start, end, "kernel", getKernelName(), "");
-    }
-
-    _activity_prof.report_gpu_timestamps<HSADispatch>(this);
 
     if (future != nullptr) {
       delete future;
@@ -4885,6 +4917,18 @@ HSADispatch::setLaunchConfiguration(const int dims, size_t *globalDims, size_t *
 }
 
 
+static std::string fenceToString(int fenceBits)
+{
+    switch (fenceBits) {
+        case 0: return "none";
+        case 1: return "acc";
+        case 2: return "sys";
+        case 3: return "sys";
+        default: return "???";
+    };
+}
+
+
 // ----------------------------------------------------------------------
 // member function implementation of HSABarrier
 // ----------------------------------------------------------------------
@@ -4915,8 +4959,14 @@ HSABarrier::waitComplete() {
             }
             depss << *depAsyncOps[i];
         };
-        depAsyncOpsStr = depss.str();
+        uint64_t start = getBeginTimestamp();
+        uint64_t end   = getEndTimestamp();
+        int acqBits = extractBits(header, HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE, HSA_PACKET_HEADER_WIDTH_SCACQUIRE_FENCE_SCOPE);
+        int relBits = extractBits(header, HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE, HSA_PACKET_HEADER_WIDTH_SCRELEASE_FENCE_SCOPE);
+        LOG_PROFILE(this, start, end, "barrier", "depcnt=" + std::to_string(depCount) + ",acq=" + fenceToString(acqBits) + ",rel=" + fenceToString(relBits), depss.str())
     }
+
+    _activity_prof.report_gpu_timestamps<HSABarrier>(this);
 
     // Release references to our dependent ops:
     for (int i=0; i<depCount; i++) {
@@ -5051,30 +5101,8 @@ HSABarrier::enqueueAsync(hc::memory_scope fenceScope) {
 }
 
 
-static std::string fenceToString(int fenceBits)
-{
-    switch (fenceBits) {
-        case 0: return "none";
-        case 1: return "acc";
-        case 2: return "sys";
-        case 3: return "sys";
-        default: return "???";
-    };
-}
-
-
 inline void
 HSABarrier::dispose() {
-    if ((HCC_PROFILE & HCC_PROFILE_TRACE) && (HCC_PROFILE_VERBOSE & HCC_PROFILE_VERBOSE_BARRIER)) {
-        uint64_t start = getBeginTimestamp();
-        uint64_t end   = getEndTimestamp();
-        int acqBits = extractBits(header, HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE, HSA_PACKET_HEADER_WIDTH_SCACQUIRE_FENCE_SCOPE);
-        int relBits = extractBits(header, HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE, HSA_PACKET_HEADER_WIDTH_SCRELEASE_FENCE_SCOPE);
-        LOG_PROFILE(this, start, end, "barrier", "depcnt=" + std::to_string(depCount) + ",acq=" + fenceToString(acqBits) + ",rel=" + fenceToString(relBits), depAsyncOpsStr)
-    }
-
-    _activity_prof.report_gpu_timestamps<HSABarrier>(this);
-
     if (future != nullptr) {
       delete future;
       future = nullptr;
