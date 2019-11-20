@@ -4512,18 +4512,13 @@ HSADispatch::dispatchKernel(hsa_queue_t* lockedHsaQueue, const void *hostKernarg
 inline void
 HSADispatch::wait() {
     if (_signal.handle) {
-        DBOUT(DB_MISC, "wait for kernel dispatch op#" << *this  << " completion with wait flag: " << waitMode << "  signal="<< std::hex  << _signal.handle << std::dec << "\n");
-
         // wait for completion
         hsa_signal_wait_scacquire(_signal, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, waitMode);
-
-        DBOUT (DB_MISC, "complete!\n");
     } else {
         // Some commands may have null signal - in this case we can't actually
         // track their status so assume they are complete.
         // In practice, apps would need to use another form of synchronization for
         // these such as waiting on a younger command or using a queue sync.
-        DBOUT (DB_MISC, "null signal, considered complete\n");
     }
 }
 
@@ -4794,15 +4789,8 @@ HSADispatch::setLaunchConfiguration(const int dims, size_t *globalDims, size_t *
 // wait for the barrier to complete
 inline void
 HSABarrier::wait() {
-    DBOUT(DB_WAIT,  "  wait for barrier " << *this << " completion with wait flag: " << waitMode << "  signal="<< std::hex  << _signal.handle << std::dec <<"...\n");
-
     // Wait on completion signal until the barrier is finished
     hsa_signal_wait_scacquire(_signal, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, waitMode);
-
-    // Release references to our dependent ops:
-    for (int i=0; i<depCount; i++) {
-        depAsyncOps[i] = nullptr;
-    }
 }
 
 
@@ -4938,6 +4926,11 @@ HSABarrier::dispose() {
 
     _activity_prof.report_gpu_timestamps<HSABarrier>(this);
 
+    // Release references to our dependent ops:
+    for (int i=0; i<depCount; i++) {
+        depAsyncOps[i] = nullptr;
+    }
+
     Kalmar::ctx->releaseSignal(_signal);
 }
 
@@ -5004,22 +4997,10 @@ HSACopy::HSACopy(Kalmar::KalmarQueue *queue, const void* src_, void* dst_, size_
 // wait for the async copy to complete
 inline void
 HSACopy::wait() {
-    // Wait on completion signal until the async copy is finishedS
-    if (DBFLAG(DB_WAIT)) {
-        hsa_signal_value_t v = -1000;
-        if (_signal.handle) {
-            hsa_signal_load_scacquire(_signal);
-        }
-        DBOUT(DB_WAIT, "  wait for copy op#" << getSeqNum() << " completion with wait flag: " << waitMode << "signal="<< std::hex  << _signal.handle << std::dec <<" currentVal=" << v << "...\n");
-    }
-
     // Wait on completion signal until the async copy is finished
     if (_signal.handle) {
         hsa_signal_wait_scacquire(_signal, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, waitMode);
     }
-
-    // clear reference counts for dependent ops.
-    depAsyncOp = nullptr;
 }
 
 
@@ -5384,6 +5365,9 @@ HSACopy::enqueueAsyncCopy2dCommand(size_t width, size_t height, size_t srcPitch,
 
 inline void
 HSACopy::dispose() {
+
+    // clear reference counts for dependent ops.
+    depAsyncOp = nullptr;
 
     // HSA signal may not necessarily be allocated by HSACopy instance
     // only release the signal if it was really allocated
