@@ -922,15 +922,20 @@ public:
         _barrierNextKernelNeedsSysAcquire(false),
         waitMode(HSA_WAIT_STATE_BLOCKED)
     {
-
         if (dependent_op != nullptr) {
             assert (dependent_op->getCommandKind() == Kalmar::hcCommandMarker);
 
             depAsyncOps[0] = std::static_pointer_cast<HSAOp> (dependent_op);
             depCount = 1;
+            if ((HCC_PROFILE & HCC_PROFILE_TRACE) && (HCC_PROFILE_VERBOSE & HCC_PROFILE_VERBOSE_BARRIER)) {
+                std::stringstream depss;
+                depss << " deps=" << *depAsyncOps[0];
+                depAsyncOpsStr = depss.str();
+            }
         } else {
             depCount = 0;
         }
+
     }
 
     // constructor with at most 5 prior dependencies
@@ -949,6 +954,18 @@ public:
                     depAsyncOps[depCount] = std::static_pointer_cast<HSAOp> (dependent_op_array[i]);
                     depCount++;
                 }
+            }
+            if ((HCC_PROFILE & HCC_PROFILE_TRACE) && (HCC_PROFILE_VERBOSE & HCC_PROFILE_VERBOSE_BARRIER)) {
+                std::stringstream depss;
+                for (int i=0; i<depCount; i++) {
+                    if (i==0) {
+                        depss << " deps=";
+                    } else {
+                        depss << ",";
+                    }
+                    depss << *depAsyncOps[i];
+                };
+                depAsyncOpsStr = depss.str();
             }
         } else {
             // throw an exception
@@ -1580,20 +1597,22 @@ public:
 
         // if youngest op doesn't have a signal, enqueue a marker to add the signal
         auto youngest_op = back();
-        hsa_signal_t signal = *(static_cast <hsa_signal_t*> (back()->getNativeHandle()));
-        if (!signal.handle) {
-            auto marker = EnqueueMarker(hc::no_scope);
-            DBOUT(DB_CMD2, "No signal found in wait, enqueued marker into " << *this << "\n");
-        }
-        back()->wait();
-        if (HCC_FLUSH_ON_WAIT) {
-            // aggressively cleanup resources
-            // but keep back() as a valid HSAOp, so decrement current insert index twice
-            int back_op_index = decrement(asyncOpsIndex); // index of back() op
-            int index = decrement(back_op_index); // index of first op to free
-            while (asyncOps[index] != nullptr && index != back_op_index) {
-                asyncOps[index] = nullptr;
-                index = decrement(index);
+        if (youngest_op != nullptr) {
+            hsa_signal_t signal = *(static_cast <hsa_signal_t*> (back()->getNativeHandle()));
+            if (!signal.handle) {
+                auto marker = EnqueueMarker(hc::no_scope);
+                DBOUT(DB_CMD2, "No signal found in wait, enqueued marker into " << *this << "\n");
+            }
+            back()->wait();
+            if (HCC_FLUSH_ON_WAIT) {
+                // aggressively cleanup resources
+                // but keep back() as a valid HSAOp, so decrement current insert index twice
+                int back_op_index = decrement(asyncOpsIndex); // index of back() op
+                int index = decrement(back_op_index); // index of first op to free
+                while (asyncOps[index] != nullptr && index != back_op_index) {
+                    asyncOps[index] = nullptr;
+                    index = decrement(index);
+                }
             }
         }
     }
@@ -1946,6 +1965,7 @@ public:
  
     // enqueue a barrier packet
     std::shared_ptr<KalmarAsyncOp> EnqueueMarker(memory_scope release_scope) override {
+        std::lock_guard<std::recursive_mutex> lg(qmutex);
         // create shared_ptr instance
         std::shared_ptr<HSABarrier> barrier = std::make_shared<HSABarrier>(this, 0, nullptr);
         // associate the barrier with this queue
@@ -1969,6 +1989,7 @@ public:
     std::shared_ptr<KalmarAsyncOp> EnqueueMarkerWithDependency(int count,
             std::shared_ptr <KalmarAsyncOp> *depOps,
             hc::memory_scope fenceScope) override {
+        std::lock_guard<std::recursive_mutex> lg(qmutex);
 
         if ((count >= 0) && (count <= HSA_BARRIER_DEP_SIGNAL_CNT)) {
 
@@ -4121,6 +4142,7 @@ bool HSAQueue::copy2d_ext(const void *src, void *dst, size_t width, size_t heigh
 std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopyExt(const void* src, void* dst, size_t size_bytes,
                                                    hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo,
                                                    const Kalmar::KalmarDevice *copyDevice) override {
+    std::lock_guard<std::recursive_mutex> lg(qmutex);
     // create shared_ptr instance
     const Kalmar::HSADevice *copyDeviceHsa = static_cast<const Kalmar::HSADevice*> (copyDevice);
     std::shared_ptr<HSACopy> copyCommand = std::make_shared<HSACopy>(this, src, dst, size_bytes);
@@ -4137,6 +4159,7 @@ std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopyExt(const void* src, vo
 std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopy2dExt(const void* src, void* dst, size_t width, size_t height, size_t srcPitch, size_t dstPitch,
                                                    hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo,
                                                    const Kalmar::KalmarDevice *copyDevice) override {
+    std::lock_guard<std::recursive_mutex> lg(qmutex);
     //create shared_ptr instance
     const Kalmar::HSADevice *copy2dDeviceHsa = static_cast<const Kalmar::HSADevice*> (copyDevice);
     std::shared_ptr<HSACopy> copy2dCommand = std::make_shared<HSACopy>(this, src, dst, width*height);
@@ -4152,6 +4175,7 @@ std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopy2dExt(const void* src, 
 
 // enqueue an async copy command
 std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopy(const void *src, void *dst, size_t size_bytes) override {
+    std::lock_guard<std::recursive_mutex> lg(qmutex);
     // create shared_ptr instance
     std::shared_ptr<HSACopy> copyCommand = std::make_shared<HSACopy>(this, src, dst, size_bytes);
 
@@ -4774,19 +4798,6 @@ HSABarrier::wait() {
 
     // Wait on completion signal until the barrier is finished
     hsa_signal_wait_scacquire(_signal, HSA_SIGNAL_CONDITION_LT, 1, UINT64_MAX, waitMode);
-
-    if ((HCC_PROFILE & HCC_PROFILE_TRACE) && (HCC_PROFILE_VERBOSE & HCC_PROFILE_VERBOSE_BARRIER) && depAsyncOpsStr.empty()) {
-        std::stringstream depss;
-        for (int i=0; i<depCount; i++) {
-            if (i==0) {
-                depss << " deps=";
-            } else {
-                depss << ",";
-            }
-            depss << *depAsyncOps[i];
-        };
-        depAsyncOpsStr = depss.str();
-    }
 
     // Release references to our dependent ops:
     for (int i=0; i<depCount; i++) {

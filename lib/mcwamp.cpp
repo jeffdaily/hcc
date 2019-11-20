@@ -51,7 +51,7 @@ struct RuntimeImpl {
   ~RuntimeImpl() {
     if (m_RuntimeHandle) {
       m_ShutdownImpl();
-      dlclose(m_RuntimeHandle);
+      //dlclose(m_RuntimeHandle);
     }
   }
 
