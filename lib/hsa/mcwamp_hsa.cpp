@@ -2138,7 +2138,7 @@ public:
     void copy_ext(const void *src, void *dst, size_t size_bytes, hc::hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo,
                   const Kalmar::KalmarDevice *copyDevice, bool forceUnpinnedCopy) override ;
 
-    void copy2d_ext(const void *src, void *dst, size_t width, size_t height, size_t srcPitch, size_t dstPitch, hc::hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo, const Kalmar::KalmarDevice *copyDevice, bool forceUnpinnedCopy);
+    bool copy2d_ext(const void *src, void *dst, size_t width, size_t height, size_t srcPitch, size_t dstPitch, hc::hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo, const Kalmar::KalmarDevice *copyDevice, bool forceUnpinnedCopy);
 
 };
 
@@ -4157,13 +4157,14 @@ void HSAQueue::copy_ext(const void *src, void *dst, size_t size_bytes, hc::hcCom
     delete(copyCommand);
 };
 
-void HSAQueue::copy2d_ext(const void *src, void *dst, size_t width, size_t height, size_t srcPitch, size_t dstPitch, hc::hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo, const Kalmar::KalmarDevice *copyDevice, bool forceUnpinnedCopy) { 
+bool HSAQueue::copy2d_ext(const void *src, void *dst, size_t width, size_t height, size_t srcPitch, size_t dstPitch, hc::hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo, const Kalmar::KalmarDevice *copyDevice, bool forceUnpinnedCopy) {
     this->wait();
     const Kalmar::HSADevice *copyDeviceHsa = static_cast<const Kalmar::HSADevice*> (copyDevice);
     HSACopy* copyCommand = new HSACopy(this, src, dst, width*height);
     copyCommand->setCommandKind(copyDir);
     copyCommand->syncCopy2DExt(copyDir, srcPtrInfo, dstPtrInfo, width, height, srcPitch, dstPitch,copyDeviceHsa, forceUnpinnedCopy);
     delete(copyCommand);
+    return true;
 };
 
 std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopyExt(const void* src, void* dst, size_t size_bytes,
