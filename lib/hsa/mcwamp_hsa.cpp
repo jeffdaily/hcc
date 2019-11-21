@@ -1276,6 +1276,8 @@ private:
     // for details
     std::mutex   qmutex;  // Protect structures for this KalmarQueue.  Currently just the hsaQueue.
 
+    std::thread::id qmutex_thread_id; // identify which thread holds qmutex when acquireLockedHsaQueue is used
+
 
     bool         drainingQueue_;  // mode that we are draining queue, used to allow barrier ops to be enqueued.
 
@@ -1997,10 +1999,13 @@ public:
         return true;
     }
 
+    void dispatch_hsa_kernel_no_lock(const hsa_kernel_dispatch_packet_t *aql,
+                             const void * args, size_t argsize,
+                             hc::completion_future *cf, const char *kernelName);
+
     void dispatch_hsa_kernel(const hsa_kernel_dispatch_packet_t *aql,
                              const void * args, size_t argsize,
-                             hc::completion_future *cf, const char *kernelName) override ;
-
+                             hc::completion_future *cf, const char *kernelName) override;
 
     bool set_cu_mask(const std::vector<bool>& cu_mask) override;
  
@@ -4106,6 +4111,7 @@ void *HSAQueue::acquireLockedHsaQueue() {
     this->qmutex.lock();
     acquireHsaQueue();
     DBOUT (DB_QUEUE, "acquireLockedHsaQueue returned hwQueue=" << this->rocrQueue->_hwQueue << "\n");
+    this->qmutex_thread_id = std::this_thread::get_id();
     return this->rocrQueue->_hwQueue;
 }
 
@@ -4113,6 +4119,7 @@ void HSAQueue::releaseLockedHsaQueue()
 {
 
     DBOUT(DB_LOCK, " ptr:" << this << " unlock...\n");
+    this->qmutex_thread_id = std::thread::id();
     this->qmutex.unlock();
 }
 
@@ -4248,12 +4255,11 @@ std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopy(const void *src, void 
 }
 
 
-void
-HSAQueue::dispatch_hsa_kernel(const hsa_kernel_dispatch_packet_t *aql,
+inline void
+HSAQueue::dispatch_hsa_kernel_no_lock(const hsa_kernel_dispatch_packet_t *aql,
                          const void * args, size_t argSize,
-                         hc::completion_future *cf, const char *kernelName) override
+                         hc::completion_future *cf, const char *kernelName)
 {
-    std::lock_guard<std::mutex> lg(qmutex);
     uint16_t dims = (aql->setup >> HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS) &
                     ((1 << HSA_KERNEL_DISPATCH_PACKET_SETUP_WIDTH_DIMENSIONS) - 1);
 
@@ -4287,6 +4293,21 @@ HSAQueue::dispatch_hsa_kernel(const hsa_kernel_dispatch_packet_t *aql,
 
     if (cf) {
         *cf = hc::completion_future(sp_dispatch);
+    }
+}
+
+void
+HSAQueue::dispatch_hsa_kernel(const hsa_kernel_dispatch_packet_t *aql,
+                         const void * args, size_t argSize,
+                         hc::completion_future *cf, const char *kernelName) override
+{
+    // caller might already hold lock from acquireLockedHsaQueue()
+    if (qmutex_thread_id == std::this_thread::get_id()) {
+        dispatch_hsa_kernel_no_lock(aql, args, argSize, cf, kernelName);
+    }
+    else {
+        std::lock_guard<std::mutex> lg(qmutex);
+        dispatch_hsa_kernel_no_lock(aql, args, argSize, cf, kernelName);
     }
 }
 
