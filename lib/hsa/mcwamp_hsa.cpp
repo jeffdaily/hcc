@@ -1274,7 +1274,7 @@ private:
     // tries to lock the queue to insert a new packet.
     // Step through the runtime code with the unit test HC/execute_order.cpp
     // for details
-    std::recursive_mutex   qmutex;  // Protect structures for this KalmarQueue.  Currently just the hsaQueue.
+    std::mutex   qmutex;  // Protect structures for this KalmarQueue.  Currently just the hsaQueue.
 
 
     bool         drainingQueue_;  // mode that we are draining queue, used to allow barrier ops to be enqueued.
@@ -1405,7 +1405,7 @@ public:
     void printAsyncOps(std::ostream &s = std::cerr)
     {
         // lock not needed -- printAsyncOps only called by HSAQueue::wait() and lock exists there
-        //std::lock_guard<std::recursive_mutex> lg(qmutex);
+        //std::lock_guard<std::mutex> lg(qmutex);
         hsa_signal_value_t oldv=0;
         s << *this << " : " << asyncOps.size() << " op entries\n";
         for (int i=0; i<asyncOps.size(); i++) {
@@ -1448,7 +1448,7 @@ public:
     void pushAsyncOp(std::shared_ptr<HSAOp> op) {
 
         // lock not needed -- lock has already been acquired by all callers of pushAsyncOp
-        //std::lock_guard<std::recursive_mutex> lg(qmutex);
+        //std::lock_guard<std::mutex> lg(qmutex);
         
         op->setSeqNumFromQueue();
 
@@ -1481,7 +1481,7 @@ public:
     std::shared_ptr<KalmarAsyncOp> detectStreamDeps(hcCommandKind newCommandKind, KalmarAsyncOp *kNewOp) {
 
         // lock not needed -- lock has already been acquired by all callers
-        //std::lock_guard<std::recursive_mutex> lg(qmutex);
+        //std::lock_guard<std::mutex> lg(qmutex);
 
         const auto newOp = static_cast<const HSAOp*> (kNewOp);
 
@@ -1551,13 +1551,14 @@ public:
     void waitForStreamDeps (HSAOp *newOp) {
         std::shared_ptr<KalmarAsyncOp> depOp = detectStreamDeps(newOp->getCommandKind(), newOp);
         if (depOp != nullptr) {
-            EnqueueMarkerWithDependency(1, &depOp, HCC_OPT_FLUSH ? hc::no_scope : hc::system_scope);
+            // lock already acquired by caller
+            EnqueueMarkerWithDependencyNoLock(1, &depOp, HCC_OPT_FLUSH ? hc::no_scope : hc::system_scope);
         }
     }
 
 
     int getPendingAsyncOps() override {
-        std::lock_guard<std::recursive_mutex> lg(qmutex);
+        std::lock_guard<std::mutex> lg(qmutex);
         int count = 0;
         for (int i = 0; i < asyncOps.size(); ++i) {
             auto &asyncOp = asyncOps[i];
@@ -1579,7 +1580,7 @@ public:
 
 
     bool isEmpty() override {
-        std::lock_guard<std::recursive_mutex> lg(qmutex);
+        std::lock_guard<std::mutex> lg(qmutex);
 
         if (!has_been_used) return true;
 
@@ -1608,14 +1609,14 @@ public:
         // Ensures younger ops have chance to complete before older ops reclaim their resources
         //
 
-        std::lock_guard<std::recursive_mutex> lg(qmutex);
+        std::lock_guard<std::mutex> lg(qmutex);
 
         if (!has_been_used) return;
 
         if (HCC_OPT_FLUSH && nextSyncNeedsSysRelease()) {
 
             // In the loop below, this will be the first op waited on
-            auto marker = EnqueueMarker(hc::system_scope);
+            auto marker = EnqueueMarkerNoLock(hc::system_scope);
 
             DBOUT(DB_CMD2, " Sys-release needed, enqueued marker into " << *this << " to release written data " << marker<<"\n");
 
@@ -1631,7 +1632,7 @@ public:
         if (youngest_op != nullptr) {
             hsa_signal_t signal = *(static_cast <hsa_signal_t*> (back()->getNativeHandle()));
             if (!signal.handle) {
-                auto marker = EnqueueMarker(hc::no_scope);
+                auto marker = EnqueueMarkerNoLock(hc::no_scope);
                 DBOUT(DB_CMD2, "No signal found in wait, enqueued marker into " << *this << "\n");
             }
             back()->wait();
@@ -1666,7 +1667,7 @@ public:
                       });
 
         {
-            std::lock_guard<std::recursive_mutex> lg(qmutex);
+            std::lock_guard<std::mutex> lg(qmutex);
             waitForStreamDeps(dispatch);
 
             // dispatch the kernel
@@ -1690,7 +1691,7 @@ public:
     }
 
     std::shared_ptr<KalmarAsyncOp> LaunchKernelWithDynamicGroupMemoryAsync(void *ker, size_t nr_dim, size_t *global, size_t *local, size_t dynamic_group_size) override {
-        std::lock_guard<std::recursive_mutex> lg(qmutex);
+        std::lock_guard<std::mutex> lg(qmutex);
 
         HSADispatch *dispatch = reinterpret_cast<HSADispatch*>(ker);
 
@@ -1971,6 +1972,8 @@ public:
         }
     }
 
+    void *acquireHsaQueue();
+
     void *acquireLockedHsaQueue();
 
     void releaseLockedHsaQueue();
@@ -2002,8 +2005,7 @@ public:
     bool set_cu_mask(const std::vector<bool>& cu_mask) override;
  
     // enqueue a barrier packet
-    std::shared_ptr<KalmarAsyncOp> EnqueueMarker(memory_scope release_scope) override {
-        std::lock_guard<std::recursive_mutex> lg(qmutex);
+    std::shared_ptr<KalmarAsyncOp> EnqueueMarkerNoLock(memory_scope release_scope) {
         // create shared_ptr instance
         std::shared_ptr<HSABarrier> barrier = std::make_shared<HSABarrier>(this, 0, nullptr);
         // enqueue the barrier
@@ -2011,6 +2013,13 @@ public:
         // associate the barrier with this queue
         pushAsyncOp(barrier);
         return barrier;
+    }
+
+
+    // enqueue a barrier packet
+    std::shared_ptr<KalmarAsyncOp> EnqueueMarker(memory_scope release_scope) override {
+        std::lock_guard<std::mutex> lg(qmutex);
+        return EnqueueMarkerNoLock(release_scope);
     }
 
 
@@ -2024,10 +2033,9 @@ public:
     //
     // fenceScope specifies the scope of the acquire and release fence that will be
     // applied after the marker executes.  See hc::memory_scope
-    std::shared_ptr<KalmarAsyncOp> EnqueueMarkerWithDependency(int count,
+    std::shared_ptr<KalmarAsyncOp> EnqueueMarkerWithDependencyNoLock(int count,
             std::shared_ptr <KalmarAsyncOp> *depOps,
             hc::memory_scope fenceScope) override {
-        std::lock_guard<std::recursive_mutex> lg(qmutex);
 
         if ((count >= 0) && (count <= HSA_BARRIER_DEP_SIGNAL_CNT)) {
 
@@ -2092,6 +2100,13 @@ public:
             // throw an exception
             throw Kalmar::runtime_exception("Incorrect number of dependent signals passed to EnqueueMarkerWithDependency", count);
         }
+    }
+
+    std::shared_ptr<KalmarAsyncOp> EnqueueMarkerWithDependency(int count,
+            std::shared_ptr <KalmarAsyncOp> *depOps,
+            hc::memory_scope fenceScope) override {
+        std::lock_guard<std::mutex> lg(qmutex);
+        return EnqueueMarkerWithDependencyNoLock(count, depOps, fenceScope);
     }
 
     std::shared_ptr<KalmarAsyncOp> EnqueueAsyncCopyExt(const void* src, void* dst, size_t size_bytes,
@@ -4008,7 +4023,7 @@ HSAQueue::HSAQueue(KalmarDevice* pDev, hsa_agent_t agent, execute_order order, q
         // Protect the HSA queue we can steal it.
         DBOUT(DB_LOCK, " ptr:" << this << " create lock_guard...\n");
 
-        std::lock_guard<std::recursive_mutex> l(this->qmutex);
+        std::lock_guard<std::mutex> l(this->qmutex);
 
         auto device = static_cast<Kalmar::HSADevice*>(this->getDev());
         device->createOrstealRocrQueue(this, priority);
@@ -4034,10 +4049,10 @@ void HSAQueue::dispose() override {
         // sequence in order to avoid potential deadlock with other threads
         // executing createOrstealRocrQueue at the same time
         std::lock_guard<std::mutex> rl(device->rocrQueuesMutex);
-        std::lock_guard<std::recursive_mutex> l(this->qmutex);
+        std::lock_guard<std::mutex> l(this->qmutex);
 
         if (HCC_OPT_FLUSH && nextSyncNeedsSysRelease()) {
-            auto marker = EnqueueMarker(hc::system_scope);
+            auto marker = EnqueueMarkerNoLock(hc::system_scope);
             DBOUTL(DB_CMD2, "HSAQueue::dispose() Sys-release needed, enqueued marker into " << *this << " to release written data " << marker);
         }
 
@@ -4077,16 +4092,20 @@ Kalmar::HSADevice * HSAQueue::getHSADev() const {
     return static_cast<Kalmar::HSADevice*>(this->getDev());
 };
 
-void *HSAQueue::acquireLockedHsaQueue() {
-    DBOUT(DB_LOCK, " ptr:" << this << " lock...\n");
-    this->qmutex.lock();
+void *HSAQueue::acquireHsaQueue() {
     if (this->rocrQueue == nullptr) {
         auto device = static_cast<Kalmar::HSADevice*>(this->getDev());
         device->createOrstealRocrQueue(this, priority);
     }
-
-    DBOUT (DB_QUEUE, "acquireLockedHsaQueue returned hwQueue=" << this->rocrQueue->_hwQueue << "\n");
     assert (this->rocrQueue->_hwQueue != 0);
+    return this->rocrQueue->_hwQueue;
+}
+
+void *HSAQueue::acquireLockedHsaQueue() {
+    DBOUT(DB_LOCK, " ptr:" << this << " lock...\n");
+    this->qmutex.lock();
+    acquireHsaQueue();
+    DBOUT (DB_QUEUE, "acquireLockedHsaQueue returned hwQueue=" << this->rocrQueue->_hwQueue << "\n");
     return this->rocrQueue->_hwQueue;
 }
 
@@ -4150,7 +4169,7 @@ void HSAQueue::copy2d_ext(const void *src, void *dst, size_t width, size_t heigh
 std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopyExt(const void* src, void* dst, size_t size_bytes,
                                                    hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo,
                                                    const Kalmar::KalmarDevice *copyDevice) override {
-    std::lock_guard<std::recursive_mutex> lg(qmutex);
+    std::lock_guard<std::mutex> lg(qmutex);
     // create shared_ptr instance
     const Kalmar::HSADevice *copyDeviceHsa = static_cast<const Kalmar::HSADevice*> (copyDevice);
     std::shared_ptr<HSACopy> copyCommand = std::make_shared<HSACopy>(this, src, dst, size_bytes);
@@ -4167,7 +4186,7 @@ std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopyExt(const void* src, vo
 std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopy2dExt(const void* src, void* dst, size_t width, size_t height, size_t srcPitch, size_t dstPitch,
                                                    hcCommandKind copyDir, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo,
                                                    const Kalmar::KalmarDevice *copyDevice) override {
-    std::lock_guard<std::recursive_mutex> lg(qmutex);
+    std::lock_guard<std::mutex> lg(qmutex);
     //create shared_ptr instance
     const Kalmar::HSADevice *copy2dDeviceHsa = static_cast<const Kalmar::HSADevice*> (copyDevice);
     std::shared_ptr<HSACopy> copy2dCommand = std::make_shared<HSACopy>(this, src, dst, width*height);
@@ -4183,7 +4202,7 @@ std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopy2dExt(const void* src, 
 
 // enqueue an async copy command
 std::shared_ptr<KalmarAsyncOp> HSAQueue::EnqueueAsyncCopy(const void *src, void *dst, size_t size_bytes) override {
-    std::lock_guard<std::recursive_mutex> lg(qmutex);
+    std::lock_guard<std::mutex> lg(qmutex);
     // create shared_ptr instance
     std::shared_ptr<HSACopy> copyCommand = std::make_shared<HSACopy>(this, src, dst, size_bytes);
 
@@ -4233,7 +4252,7 @@ HSAQueue::dispatch_hsa_kernel(const hsa_kernel_dispatch_packet_t *aql,
                          const void * args, size_t argSize,
                          hc::completion_future *cf, const char *kernelName) override
 {
-    std::lock_guard<std::recursive_mutex> lg(qmutex);
+    std::lock_guard<std::mutex> lg(qmutex);
     uint16_t dims = (aql->setup >> HSA_KERNEL_DISPATCH_PACKET_SETUP_DIMENSIONS) &
                     ((1 << HSA_KERNEL_DISPATCH_PACKET_SETUP_WIDTH_DIMENSIONS) - 1);
 
@@ -4284,7 +4303,7 @@ HSAQueue::set_cu_mask(const std::vector<bool>& cu_mask) override {
     int iter = cu_mask.size() > physical_count ? physical_count : cu_mask.size();
 
     {
-        std::lock_guard<std::recursive_mutex> l(this->qmutex);
+        std::lock_guard<std::mutex> l(this->qmutex);
 
 
         this->cu_arrays.clear();
@@ -4543,11 +4562,10 @@ HSADispatch::dispatchKernelWaitComplete() {
     hsaQueue()->setNextSyncNeedsSysRelease(false);
 
     {
-        // extract hsa_queue_t from HSAQueue
-        auto rocrQueue = reinterpret_cast<hsa_queue_t*>(hsaQueue()->acquireLockedHsaQueue());
+        // extract hsa_queue_t from HSAQueue, already locked by caller
+        auto rocrQueue = reinterpret_cast<hsa_queue_t*>(hsaQueue()->acquireHsaQueue());
         // dispatch kernel
         dispatchKernel(rocrQueue, arg_vec.data(), arg_vec.size(), true);
-        hsaQueue()->releaseLockedHsaQueue();
     }
 }
 
@@ -4571,8 +4589,8 @@ HSADispatch::dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, b
     }
 
     {
-        // extract hsa_queue_t from HSAQueue
-        auto rocrQueue = reinterpret_cast<hsa_queue_t*>(hsaQueue()->acquireLockedHsaQueue());
+        // extract hsa_queue_t from HSAQueue, already locked by caller
+        auto rocrQueue = reinterpret_cast<hsa_queue_t*>(hsaQueue()->acquireHsaQueue());
 
         // If HCC_OPT_FLUSH=1, we are not flushing to system scope after each command.
         // Set the flag so we remember to do so at next queue::wait() call.
@@ -4584,8 +4602,6 @@ HSADispatch::dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, b
 
         // dispatch kernel
         dispatchKernel(rocrQueue, hostKernarg, hostKernargSize, allocSignal);
-
-        hsaQueue()->releaseLockedHsaQueue();
     }
 
     if (HCC_SERIALIZE_KERNEL & 0x2) {
@@ -4815,7 +4831,8 @@ HSABarrier::enqueueAsync(hc::memory_scope fenceScope) {
     hc::memory_scope toDoReleaseFenceScope = fenceScope;
     hc::memory_scope toDoAcquireFenceScope = _acquire_scope;
 
-    auto rocrQueue = reinterpret_cast<hsa_queue_t*>(hsaQueue()->acquireLockedHsaQueue());
+    // queue already locked by caller
+    auto rocrQueue = reinterpret_cast<hsa_queue_t*>(hsaQueue()->acquireHsaQueue());
 
     if ( hsaQueue()->nextSyncNeedsSysRelease() ) {
          toDoReleaseFenceScope = hc::system_scope;
@@ -4911,8 +4928,6 @@ HSABarrier::enqueueAsync(hc::memory_scope fenceScope) {
     // capture the state of these flags after the barrier executes.
     _barrierNextKernelNeedsSysAcquire = hsaQueue()->nextKernelNeedsSysAcquire();
     _barrierNextSyncNeedsSysRelease   = hsaQueue()->nextSyncNeedsSysRelease();
-
-    hsaQueue()->releaseLockedHsaQueue();
 }
 
 
@@ -5163,7 +5178,8 @@ void HSACopy::hcc_memory_async_copy(Kalmar::hcCommandKind copyKind, const Kalmar
                 DBOUT( DB_CMD2, "  asyncCopy adding marker for needed dependency or release\n");
 
                 // Set depAsyncOp for use by the async copy below:
-                depAsyncOp = std::static_pointer_cast<HSAOp> (hsaQueue()->EnqueueMarkerWithDependency(0, nullptr, fenceScope));
+                // lock already acquired by caller
+                depAsyncOp = std::static_pointer_cast<HSAOp> (hsaQueue()->EnqueueMarkerWithDependencyNoLock(0, nullptr, fenceScope));
                 depSignal = * (static_cast <hsa_signal_t*> (depAsyncOp->getNativeHandle()));
             }
             else if (depAsyncOp) {
@@ -5316,7 +5332,8 @@ void HSACopy::hcc_memory_async_copy_rect(Kalmar::hcCommandKind copyKind, const K
             if ((depAsyncOp && depSignal.handle == 0x0) || (fenceScope != hc::no_scope)) {
                 DBOUT( DB_CMD2, "  asyncCopy adding marker for needed dependency or release\n");
 
-                depAsyncOp = std::static_pointer_cast<HSAOp> (hsaQueue()->EnqueueMarkerWithDependency(0, nullptr, fenceScope));
+                // lock already acquired by caller
+                depAsyncOp = std::static_pointer_cast<HSAOp> (hsaQueue()->EnqueueMarkerWithDependencyNoLock(0, nullptr, fenceScope));
                 depSignal = * (static_cast <hsa_signal_t*> (depAsyncOp->getNativeHandle()));
             };
 
