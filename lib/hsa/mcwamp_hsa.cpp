@@ -717,6 +717,9 @@ public:
     virtual bool barrierNextSyncNeedsSysRelease() const { return 0; };
     virtual bool barrierNextKernelNeedsSysAcquire() const { return 0; };
 
+    virtual bool needsActivityReport() = 0;
+    virtual void activityReport() = 0;
+
     Kalmar::HSAQueue *hsaQueue() const;
     bool isReady() override;
 
@@ -829,6 +832,8 @@ public:
     // wait for the async copy to complete
     void wait() override;
 
+    bool needsActivityReport() override;
+    void activityReport() override;
     void dispose();
 
     uint64_t getTimestampFrequency() override {
@@ -984,6 +989,8 @@ public:
     // wait for the barrier to complete
     void wait() override;
 
+    bool needsActivityReport() override;
+    void activityReport() override;
     void dispose();
 
     uint64_t getTimestampFrequency() override {
@@ -1075,6 +1082,8 @@ public:
     // wait for the kernel to finish execution
     void wait() override;
 
+    bool needsActivityReport() override;
+    void activityReport() override;
     void dispose();
 
     uint64_t getTimestampFrequency() override {
@@ -1230,7 +1239,20 @@ struct RocrQueue {
     queue_priority _priority;
 };
 
+struct SharedWrapper {
+    std::shared_ptr<HSAOp> op;
+    SharedWrapper(std::shared_ptr<HSAOp> op) : op(op) {}
+    ~SharedWrapper() { op = nullptr; }
+};
 
+static bool signalCallback(hsa_signal_value_t value, void *arg) {
+    if (arg != nullptr) {
+        SharedWrapper *wrapper = reinterpret_cast<SharedWrapper*>(arg);
+        wrapper->op->activityReport();
+        delete wrapper;
+    }
+    return false; // do not re-use callback.
+}
 
 class HSAQueue final : public KalmarQueue
 {
@@ -1434,6 +1456,12 @@ public:
                     << (op->getCommandKind() == hcCommandKernel ? ((static_cast<HSADispatch*> (op.get()))->getKernelName()) : "")  // change to getLongKernelName() for mangled name
                     << std::endl);
 
+        if (op->needsActivityReport()) {
+            hsa_signal_t signal = *((hsa_signal_t*)op->getNativeHandle());
+            auto status = hsa_amd_signal_async_handler(signal, HSA_SIGNAL_CONDITION_LT, 1, signalCallback, new SharedWrapper(op));
+            STATUS_CHECK(status, __LINE__);
+        }
+
         youngestCommandKind = op->getCommandKind();
         asyncOps[asyncOpsIndex] = std::move(op);
         asyncOpsIndex = increment(asyncOpsIndex);
@@ -1622,8 +1650,7 @@ public:
     }
 
     void LaunchKernelWithDynamicGroupMemory(void *ker, size_t nr_dim, size_t *global, size_t *local, size_t dynamic_group_size) override {
-        HSADispatch *dispatch =
-            reinterpret_cast<HSADispatch*>(ker);
+        HSADispatch *dispatch = reinterpret_cast<HSADispatch*>(ker);
         size_t tmp_local[] = {0, 0, 0};
         if (!local)
             local = tmp_local;
@@ -1636,8 +1663,6 @@ public:
                       });
 
         waitForStreamDeps(dispatch);
-
-
 
         // dispatch the kernel
         // and wait for its completion
@@ -1655,6 +1680,8 @@ public:
     }
 
     std::shared_ptr<KalmarAsyncOp> LaunchKernelWithDynamicGroupMemoryAsync(void *ker, size_t nr_dim, size_t *global, size_t *local, size_t dynamic_group_size) override {
+        std::lock_guard<std::recursive_mutex> lg(qmutex);
+
         HSADispatch *dispatch = reinterpret_cast<HSADispatch*>(ker);
 
         bool hasArrayViewBufferDeps = (kernelBufferMap.find(ker) != kernelBufferMap.end());
@@ -1671,8 +1698,6 @@ public:
 
         // create a shared_ptr instance
         std::shared_ptr<KalmarAsyncOp> sp_dispatch(dispatch);
-        // associate the kernel dispatch with this queue
-        pushAsyncOp(std::static_pointer_cast<HSAOp> (sp_dispatch));
 
         size_t tmp_local[] = {0, 0, 0};
         if (!local)
@@ -1681,6 +1706,9 @@ public:
 
         // dispatch the kernel
         dispatch->dispatchKernelAsyncFromOp();
+
+        // associate the kernel dispatch with this queue
+        pushAsyncOp(std::static_pointer_cast<HSAOp> (sp_dispatch));
 
         if (hasArrayViewBufferDeps) {
             // associate all buffers used by the kernel with the kernel dispatch instance
@@ -1968,10 +1996,10 @@ public:
         std::lock_guard<std::recursive_mutex> lg(qmutex);
         // create shared_ptr instance
         std::shared_ptr<HSABarrier> barrier = std::make_shared<HSABarrier>(this, 0, nullptr);
-        // associate the barrier with this queue
-        pushAsyncOp(barrier);
         // enqueue the barrier
         barrier.get()->enqueueAsync(release_scope);
+        // associate the barrier with this queue
+        pushAsyncOp(barrier);
         return barrier;
     }
 
@@ -1995,8 +2023,6 @@ public:
 
             // create shared_ptr instance
             std::shared_ptr<HSABarrier> barrier = std::make_shared<HSABarrier>(this, count, depOps);
-            // associate the barrier with this queue
-            pushAsyncOp(barrier);
 
             for (int i=0; i<count; i++) {
                 auto depOp = barrier->depAsyncOps[i];
@@ -2049,6 +2075,8 @@ public:
 
             // enqueue the barrier
             barrier.get()->enqueueAsync(fenceScope);
+            // associate the barrier with this queue
+            pushAsyncOp(barrier);
             return barrier;
         } else {
             // throw an exception
@@ -4248,12 +4276,13 @@ HSAQueue::dispatch_hsa_kernel(const hsa_kernel_dispatch_packet_t *aql,
     HSADispatch *dispatch = sp_dispatch.get();
     waitForStreamDeps(dispatch);
 
-    pushAsyncOp(sp_dispatch);
     dispatch->setKernelName(kernelName);
 
     // We used to skip signal creation as part of HCC_OPT_FLUSH being true.
     // However, the new asyncOps resource cleanup logic requires all async ops to have a signal.
     dispatch->dispatchKernelAsync(args, argSize, true);
+
+    pushAsyncOp(sp_dispatch);
 
     if (cf) {
         *cf = hc::completion_future(sp_dispatch);
@@ -4421,7 +4450,6 @@ static void printKernarg(const void *kernarg_address, int bytesToPrint)
 
 }
 
-
 // dispatch a kernel asynchronously
 // -  allocates signal, copies arguments into kernarg buffer, and places aql packet into queue.
 void
@@ -4587,6 +4615,24 @@ HSADispatch::dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, b
     };
 }
 
+inline bool
+HSADispatch::needsActivityReport() {
+    return (HCC_PROFILE & HCC_PROFILE_TRACE) || _activity_prof.is_enabled();
+}
+
+inline void
+HSADispatch::activityReport() {
+    if (HCC_PROFILE & HCC_PROFILE_TRACE) {
+        uint64_t start = getBeginTimestamp();
+        uint64_t end   = getEndTimestamp();
+        //std::string kname = kernel ? (kernel->kernelName + "+++" + kernel->shortKernelName) : "hmm";
+        //LOG_PROFILE(this, start, end, "kernel", kname.c_str(), std::hex << "kernel="<< kernel << " " << (kernel? kernel->kernelCodeHandle:0x0) << " aql.kernel_object=" << aql.kernel_object << std::dec);
+        LOG_PROFILE(this, start, end, "kernel", getKernelName(), "");
+    }
+
+    _activity_prof.report_gpu_timestamps<HSADispatch>(this);
+}
+
 inline void
 HSADispatch::dispose() {
     if (kernargMemory != nullptr) {
@@ -4597,16 +4643,6 @@ HSADispatch::dispose() {
 
     clearArgs();
     std::vector<uint8_t>().swap(arg_vec);
-
-    if (HCC_PROFILE & HCC_PROFILE_TRACE) {
-        uint64_t start = getBeginTimestamp();
-        uint64_t end   = getEndTimestamp();
-        //std::string kname = kernel ? (kernel->kernelName + "+++" + kernel->shortKernelName) : "hmm";
-        //LOG_PROFILE(this, start, end, "kernel", kname.c_str(), std::hex << "kernel="<< kernel << " " << (kernel? kernel->kernelCodeHandle:0x0) << " aql.kernel_object=" << aql.kernel_object << std::dec);
-        LOG_PROFILE(this, start, end, "kernel", getKernelName(), "");
-    }
-
-    _activity_prof.report_gpu_timestamps<HSADispatch>(this);
 
     Kalmar::ctx->releaseSignal(_signal);
 }
@@ -4914,8 +4950,13 @@ static std::string fenceToString(int fenceBits)
 }
 
 
+inline bool
+HSABarrier::needsActivityReport() {
+    return ((HCC_PROFILE & HCC_PROFILE_TRACE) && (HCC_PROFILE_VERBOSE & HCC_PROFILE_VERBOSE_BARRIER)) || _activity_prof.is_enabled();
+}
+
 inline void
-HSABarrier::dispose() {
+HSABarrier::activityReport() {
     if ((HCC_PROFILE & HCC_PROFILE_TRACE) && (HCC_PROFILE_VERBOSE & HCC_PROFILE_VERBOSE_BARRIER)) {
         uint64_t start = getBeginTimestamp();
         uint64_t end   = getEndTimestamp();
@@ -4925,7 +4966,10 @@ HSABarrier::dispose() {
     }
 
     _activity_prof.report_gpu_timestamps<HSABarrier>(this);
+}
 
+inline void
+HSABarrier::dispose() {
     // Release references to our dependent ops:
     for (int i=0; i<depCount; i++) {
         depAsyncOps[i] = nullptr;
@@ -5363,24 +5407,32 @@ HSACopy::enqueueAsyncCopy2dCommand(size_t width, size_t height, size_t srcPitch,
     };
 }
 
+inline bool
+HSACopy::needsActivityReport() {
+    return _signal.handle && ((HCC_PROFILE & HCC_PROFILE_TRACE) || _activity_prof.is_enabled());
+}
+
+inline void
+HSACopy::activityReport() {
+    if (HCC_PROFILE & HCC_PROFILE_TRACE) {
+        uint64_t start = getBeginTimestamp();
+        uint64_t end   = getEndTimestamp();
+
+        double bw = (double)(sizeBytes)/(end-start) * (1000.0/1024.0) * (1000.0/1024.0);
+
+        LOG_PROFILE(this, start, end, "copy", getCopyCommandString(),  "\t" << sizeBytes << " bytes;\t" << sizeBytes/1024.0/1024 << " MB;\t" << bw << " GB/s;");
+    }
+    _activity_prof.report_gpu_timestamps<HSACopy>(this, sizeBytes);
+}
+
 inline void
 HSACopy::dispose() {
-
     // clear reference counts for dependent ops.
     depAsyncOp = nullptr;
 
     // HSA signal may not necessarily be allocated by HSACopy instance
     // only release the signal if it was really allocated
     if (_signal.handle) {
-        if (HCC_PROFILE & HCC_PROFILE_TRACE) {
-            uint64_t start = getBeginTimestamp();
-            uint64_t end   = getEndTimestamp();
-
-            double bw = (double)(sizeBytes)/(end-start) * (1000.0/1024.0) * (1000.0/1024.0);
-
-            LOG_PROFILE(this, start, end, "copy", getCopyCommandString(),  "\t" << sizeBytes << " bytes;\t" << sizeBytes/1024.0/1024 << " MB;\t" << bw << " GB/s;");
-        }
-        _activity_prof.report_gpu_timestamps<HSACopy>(this, sizeBytes);
         Kalmar::ctx->releaseSignal(_signal);
     } else {
         if (HCC_PROFILE & HCC_PROFILE_TRACE) {
