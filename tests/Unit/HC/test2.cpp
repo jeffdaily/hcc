@@ -4,6 +4,8 @@
 #include <hc.hpp>
 
 #include <iostream>
+#include <chrono>
+#include <thread>
 
 #define TEST_DEBUG (0)
 
@@ -63,7 +65,12 @@ int main() {
   hc::accelerator().get_default_view().wait();
 
   // now there must be 0 pending async operations for the accelerator_view
-  ret &= (accelerator_view.get_pending_async_ops() == 0);
+  // the wait can return correctly, but before the resource cleanup occurs, try 5 times
+  for (int i = 0; i < 5; ++i) {
+      ret = (accelerator_view.get_pending_async_ops() == 0);
+      if (ret) break;
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+  }
 
   return !(ret == true);
 }

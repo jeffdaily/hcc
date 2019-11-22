@@ -75,10 +75,6 @@
 // MUST be a power of 2.
 #define MAX_INFLIGHT_COMMANDS_PER_QUEUE  (2*8192)
 
-// threshold to clean up finished kernel in HSAQueue.asyncOps
-int HCC_ASYNCOPS_SIZE = (2*8192);
-
-
 //---
 // Environment variables:
 int HCC_PRINT_ENV=0;
@@ -119,7 +115,6 @@ int HCC_MAX_QUEUES = 20;
 #define HCC_PROFILE_SUMMARY (1<<0)
 #define HCC_PROFILE_TRACE   (1<<1)
 int HCC_PROFILE=0;
-int HCC_FLUSH_ON_WAIT=1;
 
 
 #define HCC_PROFILE_VERBOSE_BASIC                   (1 << 0)   // 0x1
@@ -710,6 +705,8 @@ class HSAOp : public Kalmar::KalmarAsyncOp {
 public:
     HSAOp(hc::HSAOpId id, Kalmar::KalmarQueue *queue, hc::hcCommandKind commandKind);
 
+    ~HSAOp();
+
     const HSAOpCoord opCoord() const { return _opCoord; };
 
     void* getNativeHandle() override { return &_signal; }
@@ -722,9 +719,6 @@ public:
 
     Kalmar::HSAQueue *hsaQueue() const;
     bool isReady() override;
-
-    static constexpr uint32_t _max_dependency_chain_length = 32;
-    uint32_t           _dependency_chain_length;
 
 protected:
     uint64_t     apiStartTick;
@@ -1248,7 +1242,9 @@ struct SharedWrapper {
 static bool signalCallback(hsa_signal_value_t value, void *arg) {
     if (arg != nullptr) {
         SharedWrapper *wrapper = reinterpret_cast<SharedWrapper*>(arg);
-        wrapper->op->activityReport();
+        if (wrapper->op->needsActivityReport()) {
+            wrapper->op->activityReport();
+        }
         delete wrapper;
     }
     return false; // do not re-use callback.
@@ -1278,17 +1274,8 @@ private:
 
     std::thread::id qmutex_thread_id; // identify which thread holds qmutex when acquireLockedHsaQueue is used
 
-    //
-    // kernel dispatches and barriers associated with this HSAQueue instance
-    //
-    // When a kernel k is dispatched, we'll get a KalmarAsyncOp f.
-    // This vector would hold f.  ops are added by replacing the op within the shared_ptr.
-    // This could trigger the freeing of resources, one insertion at a time.
-    //
-    std::vector< std::shared_ptr<HSAOp> > asyncOps;
-
-    // index where the next asyncOp should be inserted into the asyncOps container
-    int asyncOpsIndex;
+    // Last op queued.
+    std::shared_ptr<HSAOp> lastOp;
 
     uint64_t                                      queueSeqNum; // sequence-number of this queue.
 
@@ -1355,6 +1342,9 @@ private:
     bool has_been_used;
 
 public:
+    // Count of pending asyncOps
+    std::atomic<unsigned> asyncOpCount;
+
     HSAQueue(KalmarDevice* pDev, hsa_agent_t agent, execute_order order, queue_priority priority) ;
 
     bool nextKernelNeedsSysAcquire() const { return _nextKernelNeedsSysAcquire; };
@@ -1384,64 +1374,6 @@ public:
         DBOUT(DB_INIT, "HSAQueue::~HSAQueue() " << this << "out\n");
     }
 
-    int increment(int index) {
-        // increment index, without using modulo
-        return ((index+1) == asyncOps.size() ? 0 : (index+1));
-    }
-
-    int decrement(int index) {
-        // decrement index, without using modulo
-        return (index == 0 ? asyncOps.size()-1 : index-1);
-    }
-
-    std::shared_ptr<HSAOp> back() {
-        // to emulate container.back(), but using the current insert index
-        return asyncOps[decrement(asyncOpsIndex)];
-    }
-
-    // FIXME: implement flush
-    //
-    void printAsyncOps(std::ostream &s = std::cerr)
-    {
-        // lock not needed -- printAsyncOps only called by HSAQueue::wait() and lock exists there
-        //std::lock_guard<std::mutex> lg(qmutex);
-        hsa_signal_value_t oldv=0;
-        s << *this << " : " << asyncOps.size() << " op entries\n";
-        for (int i=0; i<asyncOps.size(); i++) {
-            const std::shared_ptr<HSAOp> &op = asyncOps[i];
-            s << "index:" << std::setw(4) << i ;
-            if (op != nullptr) {
-                s << " op#"<< op->getSeqNum() ;
-                hsa_signal_t signal = * (static_cast<hsa_signal_t*> (op->getNativeHandle()));
-                hsa_signal_value_t v = 0;
-                if (signal.handle) {
-                    v = hsa_signal_load_scacquire(signal);
-                }
-                s  << " " << getHcCommandKindString(op->getCommandKind());
-                // TODO - replace with virtual function
-                if (op->getCommandKind() == hc::hcCommandMarker) {
-                    auto b = static_cast<HSABarrier*> (op.get());
-                    s << " acq=" << extractBits(b->header, HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE, HSA_PACKET_HEADER_WIDTH_SCACQUIRE_FENCE_SCOPE);
-                    s << ",rel=" << extractBits(b->header, HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE, HSA_PACKET_HEADER_WIDTH_SCRELEASE_FENCE_SCOPE);
-                } else if (op->getCommandKind() == hc::hcCommandKernel) {
-                    auto d = static_cast<HSADispatch*> (op.get());
-                    s << " acq=" << extractBits(d->getAql().header, HSA_PACKET_HEADER_SCACQUIRE_FENCE_SCOPE, HSA_PACKET_HEADER_WIDTH_SCACQUIRE_FENCE_SCOPE);
-                    s << ",rel=" << extractBits(d->getAql().header, HSA_PACKET_HEADER_SCRELEASE_FENCE_SCOPE, HSA_PACKET_HEADER_WIDTH_SCRELEASE_FENCE_SCOPE);
-                }
-                s  << " completion=0x" << std::hex << signal.handle << std::dec <<",value=" << v;
-
-                if (v != oldv) {
-                    s << " <--TRANSITION";
-                    oldv = v;
-                }
-            } else {
-                s << " op <nullptr>";
-            }
-            s  << "\n";
-
-        }
-    }
-
     // Save the command and type
     // TODO - can convert to reference?
     void pushAsyncOp(std::shared_ptr<HSAOp> op) {
@@ -1457,15 +1389,18 @@ public:
                     << (op->getCommandKind() == hcCommandKernel ? ((static_cast<HSADispatch*> (op.get()))->getKernelName()) : "")  // change to getLongKernelName() for mangled name
                     << std::endl);
 
-        if (op->needsActivityReport()) {
-            hsa_signal_t signal = *((hsa_signal_t*)op->getNativeHandle());
+        hsa_signal_t signal = *((hsa_signal_t*)op->getNativeHandle());
+        if (signal.handle) {
+            asyncOpCount++;
             auto status = hsa_amd_signal_async_handler(signal, HSA_SIGNAL_CONDITION_LT, 1, signalCallback, new SharedWrapper(op));
             STATUS_CHECK(status, __LINE__);
         }
+        else {
+            throw Kalmar::runtime_exception("async op missing signal", 0);
+        }
 
         youngestCommandKind = op->getCommandKind();
-        asyncOps[asyncOpsIndex] = std::move(op);
-        asyncOpsIndex = increment(asyncOpsIndex);
+        lastOp = std::move(op);
         has_been_used = true;
     }
 
@@ -1485,8 +1420,6 @@ public:
         const auto newOp = static_cast<const HSAOp*> (kNewOp);
 
         assert (newCommandKind != hcCommandInvalid);
-
-        auto lastOp = back();
 
         if (lastOp.get()!=nullptr) {
             assert (youngestCommandKind != hcCommandInvalid);
@@ -1557,43 +1490,26 @@ public:
 
 
     int getPendingAsyncOps() override {
-        std::lock_guard<std::mutex> lg(qmutex);
-        int count = 0;
-        for (int i = 0; i < asyncOps.size(); ++i) {
-            auto &asyncOp = asyncOps[i];
-
-            if (asyncOp != nullptr) {
-                hsa_signal_t signal = *(static_cast <hsa_signal_t*> (asyncOp->getNativeHandle()));
-                if (signal.handle) {
-                    hsa_signal_value_t v = hsa_signal_load_scacquire(signal);
-                    if (v != 0) {
-                        ++count;
-                    }
-                } else {
-                    ++count;
-                }
-            }
-        }
-        return count;
+        return asyncOpCount;
     }
 
 
     bool isEmpty() override {
         std::lock_guard<std::mutex> lg(qmutex);
 
-        if (!has_been_used) return true;
-
-        hsa_signal_t signal = *(static_cast <hsa_signal_t*> (back()->getNativeHandle()));
-        if (signal.handle) {
-            hsa_signal_value_t v = hsa_signal_load_scacquire(signal);
-            if (v != 0) {
+        if (lastOp.get()!=nullptr) {
+            hsa_signal_t signal = *(static_cast <hsa_signal_t*> (lastOp->getNativeHandle()));
+            if (signal.handle) {
+                hsa_signal_value_t v = hsa_signal_load_scacquire(signal);
+                if (v != 0) {
+                    return false;
+                }
+            } else {
+                // youngest has no signal - enqueue a new one:
+                auto marker = EnqueueMarkerNoLock(hc::system_scope);
+                DBOUTL(DB_CMD2, "Inside HSAQueue::isEmpty and queue contained only no-signal ops, enqueued marker " << marker << " into " << *this);
                 return false;
             }
-        } else {
-            // youngest has no signal - enqueue a new one:
-            auto marker = EnqueueMarker(hc::system_scope);
-            DBOUTL(DB_CMD2, "Inside HSAQueue::isEmpty and queue contained only no-signal ops, enqueued marker " << marker << " into " << *this);
-            return false;
         }
 
         return true;
@@ -1621,30 +1537,15 @@ public:
 
         }
 
-        DBOUT(DB_WAIT, *this << " wait, contents:\n");
-        if (DBFLAG(DB_WAIT)) {
-            printAsyncOps(std::cerr);
-        }
-
-        // if youngest op doesn't have a signal, enqueue a marker to add the signal
-        auto youngest_op = back();
-        if (youngest_op != nullptr) {
-            hsa_signal_t signal = *(static_cast <hsa_signal_t*> (back()->getNativeHandle()));
+        // if youngest op doesn't have a signal, enqueue a marker to add the signal, which becomes the new lastOp
+        if (lastOp.get() != nullptr) {
+            hsa_signal_t signal = *(static_cast <hsa_signal_t*> (lastOp->getNativeHandle()));
             if (!signal.handle) {
                 auto marker = EnqueueMarkerNoLock(hc::no_scope);
                 DBOUT(DB_CMD2, "No signal found in wait, enqueued marker into " << *this << "\n");
             }
-            back()->wait();
-            if (HCC_FLUSH_ON_WAIT) {
-                // aggressively cleanup resources
-                // but keep back() as a valid HSAOp, so decrement current insert index twice
-                int back_op_index = decrement(asyncOpsIndex); // index of back() op
-                int index = decrement(back_op_index); // index of first op to free
-                while (asyncOps[index] != nullptr && index != back_op_index) {
-                    asyncOps[index] = nullptr;
-                    index = decrement(index);
-                }
-            }
+            lastOp->wait();
+            lastOp = nullptr;
         }
     }
 
@@ -3773,8 +3674,6 @@ void HSAContext::ReadHccEnv()
     GET_ENV_INT(HCC_MAX_QUEUES, "Set max number of HSA queues this process will use.  accelerator_views will share the allotted queues and steal from each other as necessary");
     GET_ENV_INT(HCC_LAZY_QUEUE_CREATION, "Control lazy HSA queue creation (enabled by default).  Set to 0 to disable it.");
 
-    GET_ENV_INT(HCC_ASYNCOPS_SIZE, "Number of HSA operations to allow prior to resource cleanup.");
-
     GET_ENV_INT(HCC_UNPINNED_COPY_MODE, "Select algorithm for unpinned copies. 0=ChooseBest(see thresholds), 1=PinInPlace, 2=StagingBuffer, 3=Memcpy");
 
     GET_ENV_INT(HCC_CHECK_COPY, "Check dst == src after each copy operation.  Only works on large-bar systems.");
@@ -3796,7 +3695,6 @@ void HSAContext::ReadHccEnv()
     GET_ENV_INT    (HCC_PROFILE,         "Enable HCC kernel and data profiling.  1=summary, 2=trace");
     GET_ENV_INT    (HCC_PROFILE_VERBOSE, "Bitmark to control profile verbosity and format. 0x1=default, 0x2=show begin/end, 0x4=show barrier");
     GET_ENV_STRING (HCC_PROFILE_FILE,    "Set file name for HCC_PROFILE mode.  Default=stderr");
-    GET_ENV_INT    (HCC_FLUSH_ON_WAIT,   "recover all resources on queue wait");
 
 };
 
@@ -4016,9 +3914,9 @@ std::ostream& operator<<(std::ostream& os, const HSAQueue & hav)
 HSAQueue::HSAQueue(KalmarDevice* pDev, hsa_agent_t agent, execute_order order, queue_priority priority) :
     KalmarQueue(pDev, queuing_mode_automatic, order, priority),
     rocrQueue(nullptr),
-    asyncOps(HCC_ASYNCOPS_SIZE), asyncOpsIndex(0),
+    lastOp(),
     valid(true), _nextSyncNeedsSysRelease(false), _nextKernelNeedsSysAcquire(false), bufferKernelMap(), kernelBufferMap(),
-    has_been_used(false)
+    has_been_used(false), asyncOpCount(0)
 {
 
     if (!HCC_LAZY_QUEUE_CREATION) {
@@ -4057,11 +3955,6 @@ void HSAQueue::dispose() override {
             auto marker = EnqueueMarkerNoLock(hc::system_scope);
             DBOUTL(DB_CMD2, "HSAQueue::dispose() Sys-release needed, enqueued marker into " << *this << " to release written data " << marker);
         }
-
-        // clear asyncOps to trigger any lingering resource cleanup while we still hold the locks
-        // this implicitly waits on all remaining async ops as they destruct, including the
-        // possible marker from above
-        asyncOps.clear();
 
         this->valid = false;
 
@@ -4283,7 +4176,7 @@ HSAQueue::dispatch_hsa_kernel_no_lock(const hsa_kernel_dispatch_packet_t *aql,
     dispatch->setKernelName(kernelName);
 
     // We used to skip signal creation as part of HCC_OPT_FLUSH being true.
-    // However, the new asyncOps resource cleanup logic requires all async ops to have a signal.
+    // However, the new lastOp resource cleanup logic requires all async ops to have a signal.
     dispatch->dispatchKernelAsync(args, argSize, true);
 
     pushAsyncOp(sp_dispatch);
@@ -5016,7 +4909,6 @@ HSAOp::HSAOp(hc::HSAOpId id, Kalmar::KalmarQueue *queue, hc::hcCommandKind comma
     KalmarAsyncOp(queue, commandKind),
     _opCoord(static_cast<Kalmar::HSAQueue*> (queue)),
     _agent(static_cast<Kalmar::HSADevice*>(hsaQueue()->getDev())->getAgent()),
-    _dependency_chain_length(0),
     _activity_prof(id, _opCoord._queueId, _opCoord._deviceId)
 {
     _signal.handle=0;
@@ -5029,6 +4921,10 @@ Kalmar::HSAQueue *HSAOp::hsaQueue() const
 { 
     return static_cast<Kalmar::HSAQueue *> (this->getQueue()); 
 };
+
+HSAOp::~HSAOp() {
+    hsaQueue()->asyncOpCount--;
+}
 
 bool HSAOp::isReady() override {
     return (hsa_signal_load_scacquire(_signal) == 0);
@@ -5192,17 +5088,13 @@ void HSACopy::hcc_memory_async_copy(Kalmar::hcCommandKind copyKind, const Kalmar
             // For both of these cases, we create an additional barrier packet in the source, and attach the desired fence.
             // Then we make the copy depend on the signal written by this command.
             if ((depAsyncOp && depSignal.handle == 0x0) || 
-                  (fenceScope != hc::no_scope) ||
-                  (depAsyncOp && depAsyncOp->_dependency_chain_length > _max_dependency_chain_length)) {
+                  (fenceScope != hc::no_scope)) {
                 DBOUT( DB_CMD2, "  asyncCopy adding marker for needed dependency or release\n");
 
                 // Set depAsyncOp for use by the async copy below:
                 // lock already acquired by caller
                 depAsyncOp = std::static_pointer_cast<HSAOp> (hsaQueue()->EnqueueMarkerWithDependencyNoLock(0, nullptr, fenceScope));
                 depSignal = * (static_cast <hsa_signal_t*> (depAsyncOp->getNativeHandle()));
-            }
-            else if (depAsyncOp) {
-              this->_dependency_chain_length = depAsyncOp->_dependency_chain_length + 1;
             }
 
             depSignalCnt = 1;
