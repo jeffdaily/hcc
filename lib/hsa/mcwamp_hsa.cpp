@@ -729,6 +729,8 @@ protected:
     hsa_agent_t  _agent;
 
     activity_prof::ActivityProf _activity_prof;
+
+    std::weak_ptr<std::atomic<unsigned> > asyncOpCount;
 };
 std::ostream& operator<<(std::ostream& os, const HSAOp & op);
 
@@ -1343,7 +1345,7 @@ private:
 
 public:
     // Count of pending asyncOps
-    std::atomic<unsigned> asyncOpCount;
+    std::shared_ptr<std::atomic<unsigned> > asyncOpCount;
 
     HSAQueue(KalmarDevice* pDev, hsa_agent_t agent, execute_order order, queue_priority priority) ;
 
@@ -1391,7 +1393,7 @@ public:
 
         hsa_signal_t signal = *((hsa_signal_t*)op->getNativeHandle());
         if (signal.handle) {
-            asyncOpCount++;
+            (*asyncOpCount)++;
             auto status = hsa_amd_signal_async_handler(signal, HSA_SIGNAL_CONDITION_LT, 1, signalCallback, new SharedWrapper(op));
             STATUS_CHECK(status, __LINE__);
         }
@@ -1490,7 +1492,7 @@ public:
 
 
     int getPendingAsyncOps() override {
-        return asyncOpCount;
+        return *asyncOpCount;
     }
 
 
@@ -1518,13 +1520,11 @@ public:
 
     // Must retain this exact function signature here even though mode not used since virtual interface in
     // runtime depends on this signature.
-    void wait(hcWaitMode mode = hcWaitModeBlocked) override {
+    void wait_no_lock(hcWaitMode mode = hcWaitModeBlocked) override {
         // wait on all previous async operations to complete
         // Go in reverse order (from youngest to oldest).
         // Ensures younger ops have chance to complete before older ops reclaim their resources
         //
-
-        std::lock_guard<std::mutex> lg(qmutex);
 
         if (!has_been_used) return;
 
@@ -1549,11 +1549,19 @@ public:
         }
     }
 
+    // Must retain this exact function signature here even though mode not used since virtual interface in
+    // runtime depends on this signature.
+    void wait(hcWaitMode mode = hcWaitModeBlocked) override {
+        std::lock_guard<std::mutex> lg(qmutex);
+        wait_no_lock(mode);
+    }
+
     void LaunchKernel(void *ker, size_t nr_dim, size_t *global, size_t *local) override {
         LaunchKernelWithDynamicGroupMemory(ker, nr_dim, global, local, 0);
     }
 
     void LaunchKernelWithDynamicGroupMemory(void *ker, size_t nr_dim, size_t *global, size_t *local, size_t dynamic_group_size) override {
+        std::lock_guard<std::mutex> lg(qmutex);
         HSADispatch *dispatch = reinterpret_cast<HSADispatch*>(ker);
         size_t tmp_local[] = {0, 0, 0};
         if (!local)
@@ -1566,18 +1574,14 @@ public:
                         waitForDependentAsyncOps(buffer);
                       });
 
-        {
-            std::lock_guard<std::mutex> lg(qmutex);
-            waitForStreamDeps(dispatch);
+        waitForStreamDeps(dispatch);
 
-            // dispatch the kernel
-            // and wait for its completion
-            dispatch->dispatchKernelWaitComplete();
-        }
+        // dispatch the kernel
+        // and wait for its completion
+        dispatch->dispatchKernelWaitComplete();
+
         // wait for completion
-        // This used to be inside dispatchKernelWaitComplete, but that function might manipulate the HSAQueue,
-        // so we must lock the queue, but we don't want to hold the lock while waiting.
-        wait();
+        wait_no_lock();
 
         // clear data in kernelBufferMap
         kernelBufferMap[ker].clear();
@@ -3916,7 +3920,7 @@ HSAQueue::HSAQueue(KalmarDevice* pDev, hsa_agent_t agent, execute_order order, q
     rocrQueue(nullptr),
     lastOp(),
     valid(true), _nextSyncNeedsSysRelease(false), _nextKernelNeedsSysAcquire(false), bufferKernelMap(), kernelBufferMap(),
-    has_been_used(false), asyncOpCount(0)
+    has_been_used(false), asyncOpCount(new std::atomic<unsigned>(0))
 {
 
     if (!HCC_LAZY_QUEUE_CREATION) {
@@ -3951,10 +3955,7 @@ void HSAQueue::dispose() override {
         std::lock_guard<std::mutex> rl(device->rocrQueuesMutex);
         std::lock_guard<std::mutex> l(this->qmutex);
 
-        if (HCC_OPT_FLUSH && nextSyncNeedsSysRelease()) {
-            auto marker = EnqueueMarkerNoLock(hc::system_scope);
-            DBOUTL(DB_CMD2, "HSAQueue::dispose() Sys-release needed, enqueued marker into " << *this << " to release written data " << marker);
-        }
+        wait_no_lock();
 
         this->valid = false;
 
@@ -4909,7 +4910,8 @@ HSAOp::HSAOp(hc::HSAOpId id, Kalmar::KalmarQueue *queue, hc::hcCommandKind comma
     KalmarAsyncOp(queue, commandKind),
     _opCoord(static_cast<Kalmar::HSAQueue*> (queue)),
     _agent(static_cast<Kalmar::HSADevice*>(hsaQueue()->getDev())->getAgent()),
-    _activity_prof(id, _opCoord._queueId, _opCoord._deviceId)
+    _activity_prof(id, _opCoord._queueId, _opCoord._deviceId),
+    asyncOpCount(static_cast<Kalmar::HSAQueue*>(queue)->asyncOpCount)
 {
     _signal.handle=0;
     apiStartTick = Kalmar::ctx->getSystemTicks();
@@ -4923,7 +4925,10 @@ Kalmar::HSAQueue *HSAOp::hsaQueue() const
 };
 
 HSAOp::~HSAOp() {
-    hsaQueue()->asyncOpCount--;
+    auto counter = asyncOpCount.lock();
+    if (counter) {
+        (*counter)--;
+    }
 }
 
 bool HSAOp::isReady() override {
