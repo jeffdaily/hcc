@@ -1278,9 +1278,6 @@ private:
 
     std::thread::id qmutex_thread_id; // identify which thread holds qmutex when acquireLockedHsaQueue is used
 
-
-    bool         drainingQueue_;  // mode that we are draining queue, used to allow barrier ops to be enqueued.
-
     //
     // kernel dispatches and barriers associated with this HSAQueue instance
     //
