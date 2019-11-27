@@ -1600,15 +1600,11 @@ public:
     };
 
 
-    // Must retain this exact function signature here even though mode not used since virtual interface in
-    // runtime depends on this signature.
-    void wait(hcWaitMode mode = hcWaitModeBlocked) override {
+    void wait_no_lock(hcWaitMode mode = hcWaitModeBlocked) {
         // wait on all previous async operations to complete
         // Go in reverse order (from youngest to oldest).
         // Ensures younger ops have chance to complete before older ops reclaim their resources
         //
-
-        std::lock_guard<std::mutex> lg(qmutex);
 
         if (!has_been_used) return;
 
@@ -1646,6 +1642,13 @@ public:
                 }
             }
         }
+    }
+
+    // Must retain this exact function signature here even though mode not used since virtual interface in
+    // runtime depends on this signature.
+    void wait(hcWaitMode mode = hcWaitModeBlocked) override {
+        std::lock_guard<std::mutex> lg(qmutex);
+        wait_no_lock(mode);
     }
 
     void LaunchKernel(void *ker, size_t nr_dim, size_t *global, size_t *local) override {
@@ -4053,10 +4056,7 @@ void HSAQueue::dispose() override {
         std::lock_guard<std::mutex> rl(device->rocrQueuesMutex);
         std::lock_guard<std::mutex> l(this->qmutex);
 
-        if (HCC_OPT_FLUSH && nextSyncNeedsSysRelease()) {
-            auto marker = EnqueueMarkerNoLock(hc::system_scope);
-            DBOUTL(DB_CMD2, "HSAQueue::dispose() Sys-release needed, enqueued marker into " << *this << " to release written data " << marker);
-        }
+        wait_no_lock();
 
         // clear asyncOps to trigger any lingering resource cleanup while we still hold the locks
         // this implicitly waits on all remaining async ops as they destruct, including the
@@ -4604,7 +4604,8 @@ HSADispatch::dispatchKernelAsync(const void *hostKernarg, int hostKernargSize, b
     }
 
     if (HCC_SERIALIZE_KERNEL & 0x1) {
-        hsaQueue()->wait();
+        // already locked by caller
+        hsaQueue()->wait_no_lock();
     }
 
     {
@@ -5401,7 +5402,8 @@ inline void
 HSACopy::enqueueAsyncCopyCommand(const Kalmar::HSADevice *copyDevice, const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo) {
 
     if (HCC_SERIALIZE_COPY & 0x1) {
-        hsaQueue()->wait();
+        // already locked by caller
+        hsaQueue()->wait_no_lock();
     }
 
     // Performs an async copy.
@@ -5422,7 +5424,8 @@ HSACopy::enqueueAsyncCopy2dCommand(size_t width, size_t height, size_t srcPitch,
                                     const hc::AmPointerInfo &srcPtrInfo, const hc::AmPointerInfo &dstPtrInfo) {
 
     if (HCC_SERIALIZE_COPY & 0x1) {
-        hsaQueue()->wait();
+        // already locked by caller
+        hsaQueue()->wait_no_lock();
     }
 
     isAsync = true;
